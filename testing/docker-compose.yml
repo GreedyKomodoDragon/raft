@@ -1,0 +1,27 @@
+version: '3.1'
+
+services:
+  raft_1:
+    image: raft-test:latest
+    hostname: raft_1
+    environment:
+      - NODES=node2,node3
+      - ADDRESSES=node_2:1111,node_3:1111
+
+  raft_2:
+    image: raft-test:latest
+    hostname: raft_2
+    environment:
+      - NODES=node1,node3
+      - ADDRESSES=node_1:1111,node_3:1111
+
+  raft_3:
+    image: raft-test:latest
+    hostname: raft_3
+    environment:
+      - NODES=node1,node2
+      - ADDRESSES=node_1:1111,node_2:1111
+
+networks:
+  raftnet:
+    driver: bridge
