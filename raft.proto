@@ -8,8 +8,9 @@ package raft;
 service RaftService {
    rpc GetStatus(StatusRequest) returns (StatusResult) {}
    rpc RequestVotes(RequestVotesRequest) returns (RequestVotesResult) {}
-   rpc AppendEntries(stream AppendEntriesRequest) returns (AppendEntriesResult) {} 
-   rpc HeartBeat(stream HeartBeatRequest) returns (HeartBeatResult) {} 
+   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResult) {} 
+   rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResult) {} 
+   // rpc UncommitEntry(UncommitEntry) returns (UncommitEntryResult) {} 
 }
 
 message StatusRequest {}

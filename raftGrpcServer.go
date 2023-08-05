@@ -2,6 +2,7 @@ package raft
 
 import (
 	context "context"
+	"fmt"
 
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
@@ -11,17 +12,20 @@ import (
 type raftGrpcServer interface {
 	GetStatus(context.Context, *StatusRequest) (*StatusResult, error)
 	RequestVotes(context.Context, *RequestVotesRequest) (*RequestVotesResult, error)
-	AppendEntries(AppendEntriesServer) error
-	HeartBeat(HeartBeatServer) error
+	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResult, error)
+	HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
 type raftServer struct {
+	logStore LogStore
 	UnimplementedRaftServiceServer
 }
 
-func newRaftGrpcServer() raftGrpcServer {
-	return &raftServer{}
+func newRaftGrpcServer(logStore LogStore) raftGrpcServer {
+	return &raftServer{
+		logStore: logStore,
+	}
 }
 
 func (r *raftServer) GetStatus(ctx context.Context, req *StatusRequest) (*StatusResult, error) {
@@ -32,12 +36,19 @@ func (r *raftServer) RequestVotes(ctx context.Context, req *RequestVotesRequest)
 	return nil, nil
 }
 
-func (r *raftServer) AppendEntries(server AppendEntriesServer) error {
-	return nil
+func (r *raftServer) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResult, error) {
+	r.logStore.AppendLog(Log{
+		Term:    req.Term,
+		LogType: req.Type,
+		Data:    req.Data,
+	})
+
+	fmt.Println(req.Term)
+	return &AppendEntriesResult{Applied: true}, nil
 }
 
-func (r *raftServer) HeartBeat(server HeartBeatServer) error {
-	return nil
+func (r *raftServer) HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error) {
+	return nil, nil
 }
 
 // UnimplementedRaftServiceServer must be embedded to have forward compatible implementations.
@@ -50,11 +61,11 @@ func (UnimplementedRaftServiceServer) GetStatus(context.Context, *StatusRequest)
 func (UnimplementedRaftServiceServer) RequestVotes(context.Context, *RequestVotesRequest) (*RequestVotesResult, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestVotes not implemented")
 }
-func (UnimplementedRaftServiceServer) AppendEntries(AppendEntriesServer) error {
-	return status.Errorf(codes.Unimplemented, "method AppendEntries not implemented")
+func (UnimplementedRaftServiceServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResult, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AppendEntries not implemented")
 }
-func (UnimplementedRaftServiceServer) HeartBeat(HeartBeatServer) error {
-	return status.Errorf(codes.Unimplemented, "method HeartBeat not implemented")
+func (UnimplementedRaftServiceServer) HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method HeartBeat not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 
@@ -66,7 +77,7 @@ type UnsafeRaftServiceServer interface {
 }
 
 func RegisterRaftServiceServer(s grpc.ServiceRegistrar, srv raftGrpcServer) {
-	s.RegisterService(&RaftService_ServiceDesc, srv)
+	s.RegisterService(&raftService_ServiceDesc, srv)
 }
 
 func _RaftService_GetStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -105,62 +116,46 @@ func _RaftService_RequestVotes_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RaftService_AppendEntries_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(raftGrpcServer).AppendEntries(&raftServiceAppendEntriesServer{stream})
-}
-
-type AppendEntriesServer interface {
-	SendAndClose(*AppendEntriesResult) error
-	Recv() (*AppendEntriesRequest, error)
-	grpc.ServerStream
-}
-
-type raftServiceAppendEntriesServer struct {
-	grpc.ServerStream
-}
-
-func (x *raftServiceAppendEntriesServer) SendAndClose(m *AppendEntriesResult) error {
-	return x.ServerStream.SendMsg(m)
-}
-
-func (x *raftServiceAppendEntriesServer) Recv() (*AppendEntriesRequest, error) {
-	m := new(AppendEntriesRequest)
-	if err := x.ServerStream.RecvMsg(m); err != nil {
+func _RaftService_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AppendEntriesRequest)
+	if err := dec(in); err != nil {
 		return nil, err
 	}
-	return m, nil
+	if interceptor == nil {
+		return srv.(raftGrpcServer).AppendEntries(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.RaftService/AppendEntries",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(raftGrpcServer).AppendEntries(ctx, req.(*AppendEntriesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
-func _RaftService_HeartBeat_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(raftGrpcServer).HeartBeat(&raftServiceHeartBeatServer{stream})
-}
-
-type HeartBeatServer interface {
-	SendAndClose(*HeartBeatResult) error
-	Recv() (*HeartBeatRequest, error)
-	grpc.ServerStream
-}
-
-type raftServiceHeartBeatServer struct {
-	grpc.ServerStream
-}
-
-func (x *raftServiceHeartBeatServer) SendAndClose(m *HeartBeatResult) error {
-	return x.ServerStream.SendMsg(m)
-}
-
-func (x *raftServiceHeartBeatServer) Recv() (*HeartBeatRequest, error) {
-	m := new(HeartBeatRequest)
-	if err := x.ServerStream.RecvMsg(m); err != nil {
+func _RaftService_HeartBeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartBeatRequest)
+	if err := dec(in); err != nil {
 		return nil, err
 	}
-	return m, nil
+	if interceptor == nil {
+		return srv.(raftGrpcServer).HeartBeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.RaftService/HeartBeat",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(raftGrpcServer).HeartBeat(ctx, req.(*HeartBeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
-// RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
+// raftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var RaftService_ServiceDesc = grpc.ServiceDesc{
+var raftService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "raft.RaftService",
 	HandlerType: (*raftGrpcServer)(nil),
 	Methods: []grpc.MethodDesc{
@@ -172,18 +167,15 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "RequestVotes",
 			Handler:    _RaftService_RequestVotes_Handler,
 		},
-	},
-	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "AppendEntries",
-			Handler:       _RaftService_AppendEntries_Handler,
-			ClientStreams: true,
+			MethodName: "AppendEntries",
+			Handler:    _RaftService_AppendEntries_Handler,
 		},
 		{
-			StreamName:    "HeartBeat",
-			Handler:       _RaftService_HeartBeat_Handler,
-			ClientStreams: true,
+			MethodName: "HeartBeat",
+			Handler:    _RaftService_HeartBeat_Handler,
 		},
 	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "raft.proto",
 }

@@ -6,21 +6,24 @@ services:
     hostname: raft_1
     environment:
       - NODES=node2,node3
-      - ADDRESSES=node_2:1111,node_3:1111
+      - ADDRESSES=raft_2:2222,raft_3:2223
+      - PORT=2221
 
   raft_2:
     image: raft-test:latest
     hostname: raft_2
     environment:
       - NODES=node1,node3
-      - ADDRESSES=node_1:1111,node_3:1111
+      - ADDRESSES=raft_1:2221,raft_3:2223
+      - PORT=2222
 
   raft_3:
     image: raft-test:latest
     hostname: raft_3
     environment:
       - NODES=node1,node2
-      - ADDRESSES=node_1:1111,node_2:1111
+      - ADDRESSES=raft_1:2221,raft_2:2222
+      - PORT=2223
 
 networks:
   raftnet:

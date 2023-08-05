@@ -9,19 +9,19 @@ import (
 type raftServiceClient interface {
 	GetStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResult, error)
 	RequestVotes(ctx context.Context, in *RequestVotesRequest, opts ...grpc.CallOption) (*RequestVotesResult, error)
-	AppendEntries(ctx context.Context, opts ...grpc.CallOption) (raftService_AppendEntriesClient, error)
-	HeartBeat(ctx context.Context, opts ...grpc.CallOption) (raftService_HeartBeatClient, error)
+	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResult, error)
+	HeartBeat(ctx context.Context, in *HeartBeatRequest, opts ...grpc.CallOption) (*HeartBeatResult, error)
 }
 
-type raftClient struct {
+type raftGrpcClient struct {
 	cc grpc.ClientConnInterface
 }
 
 func newRaftServiceClient(cc grpc.ClientConnInterface) raftServiceClient {
-	return &raftClient{cc}
+	return &raftGrpcClient{cc}
 }
 
-func (c *raftClient) GetStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResult, error) {
+func (c *raftGrpcClient) GetStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResult, error) {
 	out := new(StatusResult)
 	err := c.cc.Invoke(ctx, "/raft.RaftService/GetStatus", in, out, opts...)
 	if err != nil {
@@ -30,7 +30,7 @@ func (c *raftClient) GetStatus(ctx context.Context, in *StatusRequest, opts ...g
 	return out, nil
 }
 
-func (c *raftClient) RequestVotes(ctx context.Context, in *RequestVotesRequest, opts ...grpc.CallOption) (*RequestVotesResult, error) {
+func (c *raftGrpcClient) RequestVotes(ctx context.Context, in *RequestVotesRequest, opts ...grpc.CallOption) (*RequestVotesResult, error) {
 	out := new(RequestVotesResult)
 	err := c.cc.Invoke(ctx, "/raft.RaftService/RequestVotes", in, out, opts...)
 	if err != nil {
@@ -39,70 +39,20 @@ func (c *raftClient) RequestVotes(ctx context.Context, in *RequestVotesRequest, 
 	return out, nil
 }
 
-func (c *raftClient) AppendEntries(ctx context.Context, opts ...grpc.CallOption) (raftService_AppendEntriesClient, error) {
-	stream, err := c.cc.NewStream(ctx, &RaftService_ServiceDesc.Streams[0], "/raft.RaftService/AppendEntries", opts...)
+func (c *raftGrpcClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResult, error) {
+	out := new(AppendEntriesResult)
+	err := c.cc.Invoke(ctx, "/raft.RaftService/AppendEntries", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &raftServiceAppendEntriesClient{stream}
-	return x, nil
+	return out, nil
 }
 
-type raftService_AppendEntriesClient interface {
-	Send(*AppendEntriesRequest) error
-	CloseAndRecv() (*AppendEntriesResult, error)
-	grpc.ClientStream
-}
-
-type raftServiceAppendEntriesClient struct {
-	grpc.ClientStream
-}
-
-func (x *raftServiceAppendEntriesClient) Send(m *AppendEntriesRequest) error {
-	return x.ClientStream.SendMsg(m)
-}
-
-func (x *raftServiceAppendEntriesClient) CloseAndRecv() (*AppendEntriesResult, error) {
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	m := new(AppendEntriesResult)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
-func (c *raftClient) HeartBeat(ctx context.Context, opts ...grpc.CallOption) (raftService_HeartBeatClient, error) {
-	stream, err := c.cc.NewStream(ctx, &RaftService_ServiceDesc.Streams[1], "/raft.RaftService/HeartBeat", opts...)
+func (c *raftGrpcClient) HeartBeat(ctx context.Context, in *HeartBeatRequest, opts ...grpc.CallOption) (*HeartBeatResult, error) {
+	out := new(HeartBeatResult)
+	err := c.cc.Invoke(ctx, "/raft.RaftService/HeartBeat", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &raftServiceHeartBeatClient{stream}
-	return x, nil
-}
-
-type raftService_HeartBeatClient interface {
-	Send(*HeartBeatRequest) error
-	CloseAndRecv() (*HeartBeatResult, error)
-	grpc.ClientStream
-}
-
-type raftServiceHeartBeatClient struct {
-	grpc.ClientStream
-}
-
-func (x *raftServiceHeartBeatClient) Send(m *HeartBeatRequest) error {
-	return x.ClientStream.SendMsg(m)
-}
-
-func (x *raftServiceHeartBeatClient) CloseAndRecv() (*HeartBeatResult, error) {
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	m := new(HeartBeatResult)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
+	return out, nil
 }
