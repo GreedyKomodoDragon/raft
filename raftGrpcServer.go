@@ -2,7 +2,6 @@ package raft
 
 import (
 	context "context"
-	"fmt"
 
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
@@ -19,12 +18,14 @@ type raftGrpcServer interface {
 
 type raftServer struct {
 	logStore LogStore
+	hbResult *HeartBeatResult
 	UnimplementedRaftServiceServer
 }
 
 func newRaftGrpcServer(logStore LogStore) raftGrpcServer {
 	return &raftServer{
 		logStore: logStore,
+		hbResult: &HeartBeatResult{},
 	}
 }
 
@@ -43,12 +44,11 @@ func (r *raftServer) AppendEntries(ctx context.Context, req *AppendEntriesReques
 		Data:    req.Data,
 	})
 
-	fmt.Println(req.Term)
 	return &AppendEntriesResult{Applied: true}, nil
 }
 
 func (r *raftServer) HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error) {
-	return nil, nil
+	return r.hbResult, nil
 }
 
 // UnimplementedRaftServiceServer must be embedded to have forward compatible implementations.

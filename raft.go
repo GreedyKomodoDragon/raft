@@ -3,10 +3,20 @@ package raft
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"time"
 
 	"google.golang.org/grpc"
+)
+
+type role uint32
+
+const (
+	UNKNOWN role = iota
+	FOLLOWER
+	CANDIDATE
+	LEADER
 )
 
 type Raft interface {
@@ -14,8 +24,13 @@ type Raft interface {
 }
 
 type raft struct {
-	clients []*raftClient
-	grpc    *grpc.Server
+	clients             []*raftClient
+	grpc                *grpc.Server
+	role                role
+	electionTimer       *time.Timer
+	heartbeatTimer      *time.Timer
+	heartBeatTimeout    time.Duration
+	heartBeatReqTimeout time.Duration
 }
 
 func NewRaftServer(servers []Server, logStore LogStore) Raft {
@@ -35,32 +50,61 @@ func NewRaftServer(servers []Server, logStore LogStore) Raft {
 		clients = append(clients, client)
 	}
 
+	heartBeatTimeout := time.Millisecond * 500
+
 	return &raft{
-		clients: clients,
-		grpc:    grpcServer,
+		clients:             clients,
+		grpc:                grpcServer,
+		role:                FOLLOWER,
+		electionTimer:       time.NewTimer(time.Millisecond * time.Duration(rand.Intn(500))),
+		heartbeatTimer:      time.NewTimer(heartBeatTimeout),
+		heartBeatTimeout:    heartBeatTimeout,
+		heartBeatReqTimeout: 100 * time.Millisecond,
 	}
 }
 
 func (r *raft) Start(lis net.Listener) {
-	go func() {
-		time.Sleep(500 * time.Millisecond)
+	go r.start()
 
-		for i := uint64(0); true; i++ {
-			fmt.Println("i", i)
-			for _, client := range r.clients {
-				_, err := client.gClient.AppendEntries(context.Background(), &AppendEntriesRequest{
-					Term: i,
-					Type: []byte{},
-					Data: []byte{},
-				})
-
-				fmt.Println(err)
-			}
-		}
-
-	}()
 	if err := r.grpc.Serve(lis); err != nil {
 		panic(err) // unable to handle this
 	}
+}
 
+func (r *raft) start() {
+	time.Sleep(1000 * time.Millisecond)
+	go r.startHeartBeats()
+
+	for {
+		select {
+		// case event := <-r.voteCastedEvent:
+		// 	if !event.Voted {
+		// 		// check if
+		// 		return
+		// 	}
+
+		case <-r.electionTimer.C:
+			// r.becomeCandidate()
+			// r.broadCastVotes()
+		}
+	}
+}
+
+func (r *raft) startHeartBeats() {
+	hbReq := &HeartBeatRequest{}
+	ctx := context.Background()
+
+	for {
+		<-r.heartbeatTimer.C
+
+		for _, client := range r.clients {
+			ctxTime, cancel := context.WithTimeout(ctx, r.heartBeatReqTimeout)
+			if _, err := client.gClient.HeartBeat(ctxTime, hbReq); err != nil {
+				fmt.Println("Unable to find client:", client.address)
+			}
+			cancel()
+		}
+
+		r.heartbeatTimer.Reset(r.heartBeatTimeout)
+	}
 }
