@@ -24,26 +24,47 @@ type Raft interface {
 }
 
 type raft struct {
-	clients             []*raftClient
-	grpc                *grpc.Server
-	role                role
-	electionTimer       *time.Timer
-	heartbeatTimer      *time.Timer
-	heartBeatTimeout    time.Duration
-	heartBeatReqTimeout time.Duration
+	clients []*raftClient
+	grpc    *grpc.Server
+	role    role
+	id      uint64
+
+	// election
+	votes         uint64
+	clientedVoted uint64
+	electionTimer *time.Timer
+
+	// heart beat
+	heartbeatTimer           *time.Timer
+	heartBeatTimeout         time.Duration
+	heartBeatTimeoutDuration time.Duration
+	heartBeatTime            time.Time
+
+	// channels
+	voteRequested chan *RequestVotesRequest
+	voteReceived  chan *SendVoteRequest
+	heartBeatChan chan time.Time
+
+	// indexes/terms
+	latestIndex uint64
+	latestTerm  uint64
 }
 
-func NewRaftServer(servers []Server, logStore LogStore) Raft {
+func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	var opts []grpc.ServerOption
 	grpcServer := grpc.NewServer(opts...)
 
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore))
+	heartBeatChannel := make(chan time.Time, len(servers))
+	votesReceivedChan := make(chan *SendVoteRequest, len(servers))
+	votesRequestedChan := make(chan *RequestVotesRequest, len(servers))
+
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan))
 
 	clients := []*raftClient{}
 	for _, server := range servers {
-		client, err := newRaftClient(server.Address)
+		client, err := newRaftClient(server.Address, server.Id)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("cannot make client, err=", err)
 			continue
 		}
 
@@ -53,13 +74,22 @@ func NewRaftServer(servers []Server, logStore LogStore) Raft {
 	heartBeatTimeout := time.Millisecond * 500
 
 	return &raft{
-		clients:             clients,
-		grpc:                grpcServer,
-		role:                FOLLOWER,
-		electionTimer:       time.NewTimer(time.Millisecond * time.Duration(rand.Intn(500))),
-		heartbeatTimer:      time.NewTimer(heartBeatTimeout),
-		heartBeatTimeout:    heartBeatTimeout,
-		heartBeatReqTimeout: 100 * time.Millisecond,
+		clients:                  clients,
+		grpc:                     grpcServer,
+		role:                     FOLLOWER,
+		votes:                    0,
+		clientedVoted:            0,
+		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(500+rand.Intn(3000))),
+		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
+		heartBeatTimeout:         heartBeatTimeout,
+		heartBeatTimeoutDuration: 2000 * time.Millisecond,
+		heartBeatTime:            time.Unix(0, 0),
+		heartBeatChan:            heartBeatChannel,
+		latestIndex:              0,
+		latestTerm:               0,
+		voteReceived:             votesReceivedChan,
+		voteRequested:            votesRequestedChan,
+		id:                       id,
 	}
 }
 
@@ -72,20 +102,59 @@ func (r *raft) Start(lis net.Listener) {
 }
 
 func (r *raft) start() {
-	time.Sleep(1000 * time.Millisecond)
-	go r.startHeartBeats()
-
 	for {
 		select {
-		// case event := <-r.voteCastedEvent:
-		// 	if !event.Voted {
-		// 		// check if
-		// 		return
-		// 	}
+		case t := <-r.heartBeatChan:
+			r.heartBeatTime = t
+
+		case event := <-r.voteReceived:
+			if event.Voted {
+				r.votes++
+			}
+
+			r.clientedVoted++
+
+			// if not enough nodes have voted wait
+			clientHalf := uint64(len(r.clients)) / 2
+
+			if r.clientedVoted < clientHalf || r.role == LEADER {
+				continue
+			}
+
+			if r.votes > clientHalf {
+				r.role = LEADER
+				fmt.Println("I am the leader!")
+				go r.startHeartBeats()
+			} else {
+				r.role = FOLLOWER
+			}
+
+		case event := <-r.voteRequested:
+			client, err := r.getClientByID(event.Id)
+			if err != nil {
+				fmt.Println("couldn't find client who voted", event.Id)
+			}
+
+			if _, err := client.gClient.SendVote(context.Background(), &SendVoteRequest{
+				Voted: r.sendVote(event.Index, event.Term),
+				Id:    r.id,
+			}); err != nil {
+				fmt.Println("unable to send vote to node, err=", err)
+			}
 
 		case <-r.electionTimer.C:
-			// r.becomeCandidate()
-			// r.broadCastVotes()
+			// only begin election if no heartbeat has started
+			if r.hasRecievedHeartbeat() {
+				fmt.Println("become follower")
+				continue
+			}
+
+			r.latestTerm++
+			r.role = CANDIDATE
+
+			fmt.Println("Starting election!")
+			r.resetVotes()
+			r.broadCastVotes()
 		}
 	}
 }
@@ -98,13 +167,56 @@ func (r *raft) startHeartBeats() {
 		<-r.heartbeatTimer.C
 
 		for _, client := range r.clients {
-			ctxTime, cancel := context.WithTimeout(ctx, r.heartBeatReqTimeout)
+			ctxTime, cancel := context.WithTimeout(ctx, r.heartBeatTimeoutDuration)
 			if _, err := client.gClient.HeartBeat(ctxTime, hbReq); err != nil {
-				fmt.Println("Unable to find client:", client.address)
+				fmt.Println("Unable to find client:", client.address, "err=", err)
 			}
 			cancel()
 		}
 
 		r.heartbeatTimer.Reset(r.heartBeatTimeout)
 	}
+}
+
+func (r *raft) broadCastVotes() {
+	ctx := context.Background()
+
+	for _, client := range r.clients {
+		if _, err := client.gClient.RequestVotes(ctx, &RequestVotesRequest{
+			Term:  r.latestTerm,
+			Index: r.latestTerm,
+			Id:    r.id,
+		}); err != nil {
+			fmt.Println("Unable to find client:", client.address)
+		}
+	}
+}
+
+func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
+	// if grant vote only if the candidate has higher term
+	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
+	return lastTerm > r.latestTerm || (lastTerm == r.latestTerm && lastIndex >= r.latestIndex)
+}
+
+func (r *raft) getClientByID(id uint64) (*raftClient, error) {
+	if len(r.clients) == 0 {
+		return nil, fmt.Errorf("no clients")
+	}
+
+	for _, client := range r.clients {
+		if client.id == id {
+			return client, nil
+		}
+	}
+
+	return nil, fmt.Errorf("cannot find client")
+}
+
+func (r *raft) hasRecievedHeartbeat() bool {
+	return time.Since(r.heartBeatTime) < time.Second*2
+}
+
+func (r *raft) resetVotes() {
+	r.votes = 1
+	r.clientedVoted = 1
 }

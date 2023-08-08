@@ -10,6 +10,7 @@ service RaftService {
    rpc RequestVotes(RequestVotesRequest) returns (RequestVotesResult) {}
    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResult) {} 
    rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResult) {} 
+   rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
    // rpc UncommitEntry(UncommitEntry) returns (UncommitEntryResult) {} 
 }
 
@@ -21,10 +22,11 @@ message StatusResult {
   
 message RequestVotesRequest {
    uint64 term = 1;
+   uint64 index = 2;
+   uint64 id = 3;
 }
 
 message RequestVotesResult {
-   bool voted = 1;
 }
 
 message AppendEntriesRequest {
@@ -41,4 +43,12 @@ message HeartBeatRequest {
 }
  
 message HeartBeatResult {
+}
+
+message SendVoteRequest {
+   bool voted = 1;
+   uint64 id  =2;
+}
+ 
+message SendVoteResult {
 }

@@ -8,6 +8,8 @@ services:
       - NODES=node2,node3
       - ADDRESSES=raft_2:2222,raft_3:2223
       - PORT=2221
+      - ID=1
+      - IDS=2,3
 
   raft_2:
     image: raft-test:latest
@@ -16,6 +18,8 @@ services:
       - NODES=node1,node3
       - ADDRESSES=raft_1:2221,raft_3:2223
       - PORT=2222
+      - ID=2
+      - IDS=1,3
 
   raft_3:
     image: raft-test:latest
@@ -24,6 +28,8 @@ services:
       - NODES=node1,node2
       - ADDRESSES=raft_1:2221,raft_2:2222
       - PORT=2223
+      - ID=3
+      - IDS=1,2
 
 networks:
   raftnet:

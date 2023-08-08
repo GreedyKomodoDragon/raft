@@ -11,6 +11,7 @@ type raftServiceClient interface {
 	RequestVotes(ctx context.Context, in *RequestVotesRequest, opts ...grpc.CallOption) (*RequestVotesResult, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResult, error)
 	HeartBeat(ctx context.Context, in *HeartBeatRequest, opts ...grpc.CallOption) (*HeartBeatResult, error)
+	SendVote(ctx context.Context, in *SendVoteRequest, opts ...grpc.CallOption) (*SendVoteResult, error)
 }
 
 type raftGrpcClient struct {
@@ -51,6 +52,15 @@ func (c *raftGrpcClient) AppendEntries(ctx context.Context, in *AppendEntriesReq
 func (c *raftGrpcClient) HeartBeat(ctx context.Context, in *HeartBeatRequest, opts ...grpc.CallOption) (*HeartBeatResult, error) {
 	out := new(HeartBeatResult)
 	err := c.cc.Invoke(ctx, "/raft.RaftService/HeartBeat", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *raftGrpcClient) SendVote(ctx context.Context, in *SendVoteRequest, opts ...grpc.CallOption) (*SendVoteResult, error) {
+	out := new(SendVoteResult)
+	err := c.cc.Invoke(ctx, "/raft.RaftService/SendVote", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}

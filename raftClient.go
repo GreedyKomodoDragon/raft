@@ -9,9 +9,10 @@ type raftClient struct {
 	gClient raftServiceClient
 	conn    *grpc.ClientConn
 	address string
+	id      uint64
 }
 
-func newRaftClient(address string) (*raftClient, error) {
+func newRaftClient(address string, id uint64) (*raftClient, error) {
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 
 	conn, err := grpc.Dial(address, opts...)
@@ -23,6 +24,7 @@ func newRaftClient(address string) (*raftClient, error) {
 		gClient: newRaftServiceClient(conn),
 		conn:    conn,
 		address: address,
+		id:      id,
 	}, nil
 
 }
