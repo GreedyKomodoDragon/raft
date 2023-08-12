@@ -21,6 +21,8 @@ const (
 
 type Raft interface {
 	Start(net.Listener)
+
+	LeaderChan() chan interface{}
 }
 
 type raft struct {
@@ -48,6 +50,9 @@ type raft struct {
 	// indexes/terms
 	latestIndex uint64
 	latestTerm  uint64
+
+	// leader channel
+	leaderChan chan interface{}
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -90,7 +95,12 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		voteReceived:             votesReceivedChan,
 		voteRequested:            votesRequestedChan,
 		id:                       id,
+		leaderChan:               make(chan interface{}, 1),
 	}
+}
+
+func (r *raft) LeaderChan() chan interface{} {
+	return r.leaderChan
 }
 
 func (r *raft) Start(lis net.Listener) {
@@ -130,11 +140,12 @@ func (r *raft) start() {
 
 			if r.votes > clientHalf {
 				r.role = LEADER
-				fmt.Println("I am the leader!")
 				go r.startHeartBeats()
+
+				// run in goroutine to avoid stopping if ignored
+				go func() { r.leaderChan <- nil }()
 			} else {
 				r.role = FOLLOWER
-				fmt.Println("I am follower :(")
 			}
 
 		case event := <-r.voteRequested:
