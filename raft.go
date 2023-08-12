@@ -79,7 +79,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		role:                     FOLLOWER,
 		votes:                    0,
 		clientedVoted:            0,
-		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(500+rand.Intn(3000))),
+		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(2000+rand.Intn(3000))),
 		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
 		heartBeatTimeout:         heartBeatTimeout,
 		heartBeatTimeoutDuration: 2000 * time.Millisecond,
@@ -108,6 +108,13 @@ func (r *raft) start() {
 			r.heartBeatTime = t
 
 		case event := <-r.voteReceived:
+			// if found another leader
+			if r.hasRecievedHeartbeat() || r.role == FOLLOWER {
+				fmt.Println("Demoted to follower as found leader")
+				r.role = FOLLOWER
+				continue
+			}
+
 			if event.Voted {
 				r.votes++
 			}
@@ -127,6 +134,7 @@ func (r *raft) start() {
 				go r.startHeartBeats()
 			} else {
 				r.role = FOLLOWER
+				fmt.Println("I am follower :(")
 			}
 
 		case event := <-r.voteRequested:
@@ -145,16 +153,22 @@ func (r *raft) start() {
 		case <-r.electionTimer.C:
 			// only begin election if no heartbeat has started
 			if r.hasRecievedHeartbeat() {
-				fmt.Println("become follower")
+				r.electionTimer.Reset(time.Millisecond * time.Duration(rand.Intn(3000)))
+				continue
+			}
+
+			if r.role == LEADER {
 				continue
 			}
 
 			r.latestTerm++
 			r.role = CANDIDATE
 
-			fmt.Println("Starting election!")
+			fmt.Println("Starting/reseting election!")
 			r.resetVotes()
 			r.broadCastVotes()
+
+			r.electionTimer.Reset(time.Millisecond * time.Duration(3000))
 		}
 	}
 }
@@ -169,7 +183,7 @@ func (r *raft) startHeartBeats() {
 		for _, client := range r.clients {
 			ctxTime, cancel := context.WithTimeout(ctx, r.heartBeatTimeoutDuration)
 			if _, err := client.gClient.HeartBeat(ctxTime, hbReq); err != nil {
-				fmt.Println("Unable to find client:", client.address, "err=", err)
+				fmt.Println("Unable to find client:", client.address)
 			}
 			cancel()
 		}
@@ -193,9 +207,10 @@ func (r *raft) broadCastVotes() {
 }
 
 func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
+	// if recieved heartbeat already has a leader
 	// if grant vote only if the candidate has higher term
 	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
-	return lastTerm > r.latestTerm || (lastTerm == r.latestTerm && lastIndex >= r.latestIndex)
+	return !r.hasRecievedHeartbeat() && (lastTerm > r.latestTerm || (lastTerm == r.latestTerm && lastIndex >= r.latestIndex))
 }
 
 func (r *raft) getClientByID(id uint64) (*raftClient, error) {
