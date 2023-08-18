@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -19,9 +21,15 @@ const (
 	LEADER
 )
 
+type Result struct {
+	Index uint64
+	Data  []byte
+	Err   error
+}
+
 type Raft interface {
 	Start(net.Listener)
-
+	ApplyLog([]byte) ([]byte, error)
 	LeaderChan() chan interface{}
 }
 
@@ -30,6 +38,9 @@ type raft struct {
 	grpc    *grpc.Server
 	role    role
 	id      uint64
+
+	// constants
+	clientHalfMinus uint64
 
 	// election
 	votes         uint64
@@ -46,13 +57,19 @@ type raft struct {
 	voteRequested chan *RequestVotesRequest
 	voteReceived  chan *SendVoteRequest
 	heartBeatChan chan time.Time
+	confirmedLog  chan *CommitedLog
+	applyedLogs   chan *Result
 
-	// indexes/terms
-	latestIndex uint64
-	latestTerm  uint64
+	logStore LogStore
 
 	// leader channel
 	leaderChan chan interface{}
+
+	// application apply
+	appApply ApplicationApply
+
+	// locks
+	applyLock *sync.Mutex
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -63,7 +80,9 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	votesReceivedChan := make(chan *SendVoteRequest, len(servers))
 	votesRequestedChan := make(chan *RequestVotesRequest, len(servers))
 
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan))
+	appApply := &StdOutApply{}
+
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply))
 
 	clients := []*raftClient{}
 	for _, server := range servers {
@@ -84,18 +103,21 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		role:                     FOLLOWER,
 		votes:                    0,
 		clientedVoted:            0,
+		logStore:                 logStore,
 		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(2000+rand.Intn(3000))),
 		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
 		heartBeatTimeout:         heartBeatTimeout,
 		heartBeatTimeoutDuration: 2000 * time.Millisecond,
 		heartBeatTime:            time.Unix(0, 0),
 		heartBeatChan:            heartBeatChannel,
-		latestIndex:              0,
-		latestTerm:               0,
 		voteReceived:             votesReceivedChan,
 		voteRequested:            votesRequestedChan,
 		id:                       id,
 		leaderChan:               make(chan interface{}, 1),
+		applyedLogs:              make(chan *Result, 5),
+		appApply:                 appApply,
+		applyLock:                &sync.Mutex{},
+		clientHalfMinus:          uint64(len(clients))/2 - 1,
 	}
 }
 
@@ -144,9 +166,11 @@ func (r *raft) start() {
 
 				// run in goroutine to avoid stopping if ignored
 				go func() { r.leaderChan <- nil }()
-			} else {
-				r.role = FOLLOWER
+				continue
 			}
+
+			// if not leader become a follower
+			r.role = FOLLOWER
 
 		case event := <-r.voteRequested:
 			client, err := r.getClientByID(event.Id)
@@ -172,7 +196,7 @@ func (r *raft) start() {
 				continue
 			}
 
-			r.latestTerm++
+			r.logStore.IncrementTerm()
 			r.role = CANDIDATE
 
 			fmt.Println("Starting/reseting election!")
@@ -205,13 +229,14 @@ func (r *raft) startHeartBeats() {
 
 func (r *raft) broadCastVotes() {
 	ctx := context.Background()
+	req := &RequestVotesRequest{
+		Term:  r.logStore.GetLatestTerm(),
+		Index: r.logStore.GetLatestIndex(),
+		Id:    r.id,
+	}
 
 	for _, client := range r.clients {
-		if _, err := client.gClient.RequestVotes(ctx, &RequestVotesRequest{
-			Term:  r.latestTerm,
-			Index: r.latestTerm,
-			Id:    r.id,
-		}); err != nil {
+		if _, err := client.gClient.RequestVotes(ctx, req); err != nil {
 			fmt.Println("Unable to find client:", client.address)
 		}
 	}
@@ -221,7 +246,9 @@ func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
 	// if recieved heartbeat already has a leader
 	// if grant vote only if the candidate has higher term
 	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
-	return !r.hasRecievedHeartbeat() && (lastTerm > r.latestTerm || (lastTerm == r.latestTerm && lastIndex >= r.latestIndex))
+	return !r.hasRecievedHeartbeat() &&
+		(lastTerm > r.logStore.GetLatestTerm() ||
+			(lastTerm == r.logStore.GetLatestTerm() && lastIndex >= r.logStore.GetLatestIndex()))
 }
 
 func (r *raft) getClientByID(id uint64) (*raftClient, error) {
@@ -245,4 +272,96 @@ func (r *raft) hasRecievedHeartbeat() bool {
 func (r *raft) resetVotes() {
 	r.votes = 1
 	r.clientedVoted = 1
+}
+
+func (r *raft) ApplyLog(data []byte) ([]byte, error) {
+	r.applyLock.Lock()
+	defer r.applyLock.Unlock()
+
+	count := uint64(0)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	latestIndex := r.logStore.GetLatestIndex()
+
+	req := &AppendEntriesRequest{
+		Term:  r.logStore.GetLatestTerm(),
+		Index: latestIndex,
+		Type:  DATA_LOG,
+		Data:  data,
+	}
+
+	for _, client := range r.clients {
+		wg.Add(1)
+		go r.appendClient(ctx, client, req, &wg, &count)
+	}
+
+	if err := r.logStore.AppendLog(Log{
+		Term:           r.logStore.GetLatestTerm(),
+		Index:          latestIndex,
+		LogType:        DATA_LOG,
+		Data:           data,
+		LeaderCommited: false,
+	}); err != nil {
+		fmt.Println("leader append err:", err)
+		return nil, err
+	}
+
+	wg.Wait()
+
+	if count <= r.clientHalfMinus {
+		fmt.Println("failed to confirm log")
+		return nil, fmt.Errorf("failed to confirm log")
+	}
+
+	commitReq := &CommitLogRequest{
+		Index: latestIndex,
+	}
+	for _, client := range r.clients {
+		wg.Add(1)
+		go r.applyClient(ctx, client, commitReq, &wg)
+	}
+
+	// apply log
+	data, err := r.appApply.Apply(CommitedLog{
+		Index: latestIndex,
+		Type:  DATA_LOG,
+		Data:  data,
+	})
+
+	if err != nil {
+		fmt.Println("failed to apply log:", err)
+	}
+
+	r.logStore.IncrementIndex()
+	wg.Wait()
+	return data, nil
+}
+
+func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, count *uint64) {
+	defer wg.Done()
+	result, err := client.gClient.AppendEntries(ctx, req)
+	if err != nil {
+		fmt.Println("client append err:", err)
+		return
+	}
+
+	if result.Applied {
+		atomic.AddUint64(count, 1)
+	}
+}
+
+func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {
+	defer wg.Done()
+	result, err := client.gClient.CommitLog(ctx, commitReq)
+
+	if err != nil {
+		fmt.Println("client append err:", err)
+		return
+	}
+
+	if !result.Applied {
+		fmt.Println("client failed to append")
+	}
 }

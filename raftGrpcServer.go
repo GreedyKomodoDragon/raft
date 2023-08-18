@@ -20,6 +20,7 @@ type raftGrpcServer interface {
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResult, error)
 	HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error)
 	SendVote(context.Context, *SendVoteRequest) (*SendVoteResult, error)
+	CommitLog(context.Context, *CommitLogRequest) (*CommitLogResult, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -33,16 +34,19 @@ type raftServer struct {
 	voteRequested chan *RequestVotesRequest
 	voteReceived  chan *SendVoteRequest
 
+	appApply ApplicationApply
+
 	UnimplementedRaftServiceServer
 }
 
-func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequested chan *RequestVotesRequest, voteReceived chan *SendVoteRequest) raftGrpcServer {
+func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequested chan *RequestVotesRequest, voteReceived chan *SendVoteRequest, appApply ApplicationApply) raftGrpcServer {
 	return &raftServer{
 		logStore:      logStore,
 		heartbeatChan: heartBeatChan,
 		hbResult:      &HeartBeatResult{},
 		voteRequested: voteRequested,
 		voteReceived:  voteReceived,
+		appApply:      appApply,
 	}
 }
 
@@ -56,11 +60,14 @@ func (r *raftServer) RequestVotes(ctx context.Context, req *RequestVotesRequest)
 }
 
 func (r *raftServer) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResult, error) {
-	r.logStore.AppendLog(Log{
+	if err := r.logStore.AppendLog(Log{
 		Term:    req.Term,
+		Index:   req.Index,
 		LogType: req.Type,
 		Data:    req.Data,
-	})
+	}); err != nil {
+		return &AppendEntriesResult{Applied: false}, err
+	}
 
 	return &AppendEntriesResult{Applied: true}, nil
 }
@@ -74,6 +81,31 @@ func (r *raftServer) SendVote(ctx context.Context, req *SendVoteRequest) (*SendV
 	r.voteReceived <- req
 
 	return &SendVoteResult{}, nil
+}
+
+func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*CommitLogResult, error) {
+	log, err := r.logStore.GetLog(req.Index)
+	if err != nil {
+		return &CommitLogResult{
+			Applied: false,
+		}, err
+	}
+
+	if _, err = r.appApply.Apply(CommitedLog{
+		Index: req.Index,
+		Type:  DATA_LOG,
+		Data:  log.Data,
+	}); err != nil {
+		return &CommitLogResult{
+			Applied: false,
+		}, err
+	}
+
+	r.logStore.IncrementIndex()
+
+	return &CommitLogResult{
+		Applied: err == nil,
+	}, nil
 }
 
 // UnimplementedRaftServiceServer must be embedded to have forward compatible implementations.
@@ -95,6 +127,10 @@ func (UnimplementedRaftServiceServer) HeartBeat(context.Context, *HeartBeatReque
 
 func (UnimplementedRaftServiceServer) SendVote(context.Context, *SendVoteRequest) (*SendVoteResult, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SendVote not implemented")
+}
+
+func (UnimplementedRaftServiceServer) CommitLog(context.Context, *CommitLogRequest) (*CommitLogResult, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitLog not implemented")
 }
 
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
@@ -200,6 +236,24 @@ func _RaftService_SendVote_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_CommitLog_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitLogRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(raftGrpcServer).CommitLog(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.RaftService/CommitLog",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(raftGrpcServer).CommitLog(ctx, req.(*CommitLogRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -226,6 +280,10 @@ var raftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SendVote",
 			Handler:    _RaftService_SendVote_Handler,
+		},
+		{
+			MethodName: "CommitLog",
+			Handler:    _RaftService_CommitLog_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
