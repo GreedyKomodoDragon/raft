@@ -40,7 +40,7 @@ type raft struct {
 	id      uint64
 
 	// constants
-	clientHalfMinus uint64
+	clientHalf uint64
 
 	// election
 	votes         uint64
@@ -69,7 +69,8 @@ type raft struct {
 	appApply ApplicationApply
 
 	// locks
-	applyLock *sync.Mutex
+	applyLock  *sync.Mutex
+	commitLock *sync.Mutex
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -117,7 +118,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		applyedLogs:              make(chan *Result, 5),
 		appApply:                 appApply,
 		applyLock:                &sync.Mutex{},
-		clientHalfMinus:          uint64(len(clients))/2 - 1,
+		commitLock:               &sync.Mutex{},
+		clientHalf:               uint64(len(clients)) / 2,
 	}
 }
 
@@ -275,56 +277,28 @@ func (r *raft) resetVotes() {
 }
 
 func (r *raft) ApplyLog(data []byte) ([]byte, error) {
-	r.applyLock.Lock()
-	defer r.applyLock.Unlock()
-
-	count := uint64(0)
-
-	ctx := context.Background()
-	var wg sync.WaitGroup
-
-	latestIndex := r.logStore.GetLatestIndex()
-
-	req := &AppendEntriesRequest{
-		Term:  r.logStore.GetLatestTerm(),
-		Index: latestIndex,
-		Type:  DATA_LOG,
-		Data:  data,
-	}
-
-	for _, client := range r.clients {
-		wg.Add(1)
-		go r.appendClient(ctx, client, req, &wg, &count)
-	}
-
-	if err := r.logStore.AppendLog(Log{
-		Term:           r.logStore.GetLatestTerm(),
-		Index:          latestIndex,
-		LogType:        DATA_LOG,
-		Data:           data,
-		LeaderCommited: false,
-	}); err != nil {
-		fmt.Println("leader append err:", err)
+	latestIndex, err := r.broadCastAppendLog(data)
+	if err != nil {
 		return nil, err
 	}
 
-	wg.Wait()
-
-	if count <= r.clientHalfMinus {
-		fmt.Println("failed to confirm log")
-		return nil, fmt.Errorf("failed to confirm log")
-	}
-
+	var wg sync.WaitGroup
 	commitReq := &CommitLogRequest{
 		Index: latestIndex,
 	}
+
+	ctx := context.Background()
+
+	r.commitLock.Lock()
+	defer r.commitLock.Unlock()
+
 	for _, client := range r.clients {
 		wg.Add(1)
 		go r.applyClient(ctx, client, commitReq, &wg)
 	}
 
 	// apply log
-	data, err := r.appApply.Apply(CommitedLog{
+	data, err = r.appApply.Apply(CommitedLog{
 		Index: latestIndex,
 		Type:  DATA_LOG,
 		Data:  data,
@@ -334,9 +308,57 @@ func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 		fmt.Println("failed to apply log:", err)
 	}
 
-	r.logStore.IncrementIndex()
 	wg.Wait()
 	return data, nil
+}
+
+func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
+	count := uint64(0)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	// make this re-use the structs instead of re-creating
+	req := &AppendEntriesRequest{
+		Term: r.logStore.GetLatestTerm(),
+		Type: DATA_LOG,
+		Data: data,
+	}
+
+	reqLog := Log{
+		Term:           r.logStore.GetLatestTerm(),
+		LogType:        DATA_LOG,
+		Data:           data,
+		LeaderCommited: false,
+	}
+
+	r.applyLock.Lock()
+	defer r.applyLock.Unlock()
+
+	latestIndex := r.logStore.GetLatestIndex()
+	req.Index = latestIndex
+	reqLog.Index = latestIndex
+
+	for _, client := range r.clients {
+		wg.Add(1)
+		go r.appendClient(ctx, client, req, &wg, &count)
+	}
+
+	if err := r.logStore.AppendLog(reqLog); err != nil {
+		fmt.Println("leader append err:", err)
+		return 0, err
+	}
+
+	wg.Wait()
+
+	if count <= r.clientHalf {
+		fmt.Println("failed to confirm log")
+		return 0, fmt.Errorf("failed to confirm log")
+	}
+
+	r.logStore.IncrementIndex()
+	return latestIndex, nil
+
 }
 
 func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, count *uint64) {
