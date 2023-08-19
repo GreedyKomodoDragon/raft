@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 type Log struct {
 	Term           uint64
@@ -21,14 +24,17 @@ type LogStore interface {
 }
 
 type logStore struct {
-	logs  []Log
+	logs  *safeMap
 	index uint64
 	term  uint64
 }
 
 func NewLogStore() LogStore {
 	return &logStore{
-		logs:  []Log{},
+		logs: &safeMap{
+			make(map[uint64]*Log),
+			sync.RWMutex{},
+		},
 		index: 1,
 		term:  0,
 	}
@@ -39,7 +45,7 @@ func (l *logStore) AppendLog(log Log) error {
 		return fmt.Errorf("missing slice")
 	}
 
-	l.logs = append(l.logs, log)
+	l.logs.Set(log.Index, &log)
 	return nil
 }
 
@@ -48,11 +54,12 @@ func (l *logStore) GetLog(index uint64) (*Log, error) {
 		return nil, fmt.Errorf("missing slice")
 	}
 
-	if uint64(len(l.logs)) < index {
-		return nil, fmt.Errorf("GetLog: missing index", len(l.logs), index)
+	log, ok := l.logs.Get(index)
+	if !ok {
+		return nil, fmt.Errorf("cannot find log", index)
 	}
 
-	return &l.logs[index-1], nil
+	return log, nil
 }
 
 func (l *logStore) UpdateCommited(index uint64) error {
@@ -60,11 +67,12 @@ func (l *logStore) UpdateCommited(index uint64) error {
 		return fmt.Errorf("missing slice")
 	}
 
-	if len(l.logs) < int(index) {
-		return fmt.Errorf("UpdateCommited: missing index")
+	log, ok := l.logs.Get(index)
+	if !ok {
+		return fmt.Errorf("cannot find log: %v", index)
 	}
 
-	l.logs[index-1].LeaderCommited = true
+	log.LeaderCommited = true
 	return nil
 }
 

@@ -294,8 +294,8 @@ func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 
 	ctx := context.Background()
 
+	wg.Add(2)
 	for _, client := range r.clients {
-		wg.Add(1)
 		go r.applyClient(ctx, client, r.reqCommit, &wg)
 	}
 
@@ -340,7 +340,12 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 
 	wg.Add(2)
 	for _, client := range r.clients {
-		go r.appendClient(ctx, client, r.reqAppend, &wg, &count)
+		go r.appendClient(ctx, client, &AppendEntriesRequest{
+			Index: latestIndex,
+			Term:  r.logStore.GetLatestTerm(),
+			Type:  DATA_LOG,
+			Data:  data,
+		}, &wg, &count)
 	}
 
 	if err := r.logStore.AppendLog(reqLog); err != nil {
@@ -368,13 +373,13 @@ func (r *raft) appendClient(ctx context.Context, client *raftClient, req *Append
 		result, err := client.gClient.AppendEntries(ctx, req)
 		if err != nil {
 			// fmt.Println("client append err:", err)
-			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 
 		if result.Applied {
 			atomic.AddUint64(count, 1)
 		}
+		return
 	}
 }
 

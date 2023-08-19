@@ -21,8 +21,6 @@ type StdOutApply struct {
 }
 
 func (s *StdOutApply) Apply(log CommitedLog) ([]byte, error) {
-	// if log.Index%1000 == 0 {
-	// 	fmt.Println("log applied:", log.Index)
-	// }
+	// fmt.Println("log applied:", log.Index, string(log.Data))
 	return nil, nil
 }
