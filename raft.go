@@ -71,6 +71,10 @@ type raft struct {
 	// locks
 	applyLock  *sync.Mutex
 	commitLock *sync.Mutex
+
+	// constants
+	reqAppend *AppendEntriesRequest
+	reqCommit *CommitLogRequest
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -120,6 +124,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		applyLock:                &sync.Mutex{},
 		commitLock:               &sync.Mutex{},
 		clientHalf:               uint64(len(clients)) / 2,
+		reqAppend:                &AppendEntriesRequest{},
+		reqCommit:                &CommitLogRequest{},
 	}
 }
 
@@ -278,23 +284,19 @@ func (r *raft) resetVotes() {
 
 func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 	latestIndex, err := r.broadCastAppendLog(data)
+	defer r.commitLock.Unlock()
 	if err != nil {
 		return nil, err
 	}
 
 	var wg sync.WaitGroup
-	commitReq := &CommitLogRequest{
-		Index: latestIndex,
-	}
+	r.reqCommit.Index = latestIndex
 
 	ctx := context.Background()
 
-	r.commitLock.Lock()
-	defer r.commitLock.Unlock()
-
 	for _, client := range r.clients {
 		wg.Add(1)
-		go r.applyClient(ctx, client, commitReq, &wg)
+		go r.applyClient(ctx, client, r.reqCommit, &wg)
 	}
 
 	// apply log
@@ -318,12 +320,9 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 
-	// make this re-use the structs instead of re-creating
-	req := &AppendEntriesRequest{
-		Term: r.logStore.GetLatestTerm(),
-		Type: DATA_LOG,
-		Data: data,
-	}
+	r.reqAppend.Term = r.logStore.GetLatestTerm()
+	r.reqAppend.Type = DATA_LOG
+	r.reqAppend.Data = data
 
 	reqLog := Log{
 		Term:           r.logStore.GetLatestTerm(),
@@ -336,12 +335,12 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	defer r.applyLock.Unlock()
 
 	latestIndex := r.logStore.GetLatestIndex()
-	req.Index = latestIndex
+	r.reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
+	wg.Add(2)
 	for _, client := range r.clients {
-		wg.Add(1)
-		go r.appendClient(ctx, client, req, &wg, &count)
+		go r.appendClient(ctx, client, r.reqAppend, &wg, &count)
 	}
 
 	if err := r.logStore.AppendLog(reqLog); err != nil {
@@ -357,20 +356,25 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	}
 
 	r.logStore.IncrementIndex()
+	r.commitLock.Lock()
+
 	return latestIndex, nil
 
 }
 
 func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, count *uint64) {
 	defer wg.Done()
-	result, err := client.gClient.AppendEntries(ctx, req)
-	if err != nil {
-		fmt.Println("client append err:", err)
-		return
-	}
+	for i := 0; i < 3; i++ {
+		result, err := client.gClient.AppendEntries(ctx, req)
+		if err != nil {
+			// fmt.Println("client append err:", err)
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
 
-	if result.Applied {
-		atomic.AddUint64(count, 1)
+		if result.Applied {
+			atomic.AddUint64(count, 1)
+		}
 	}
 }
 
