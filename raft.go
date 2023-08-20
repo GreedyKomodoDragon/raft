@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -57,7 +57,6 @@ type raft struct {
 	voteRequested chan *RequestVotesRequest
 	voteReceived  chan *SendVoteRequest
 	heartBeatChan chan time.Time
-	confirmedLog  chan *CommitedLog
 	applyedLogs   chan *Result
 
 	logStore LogStore
@@ -75,6 +74,10 @@ type raft struct {
 	// constants
 	reqAppend *AppendEntriesRequest
 	reqCommit *CommitLogRequest
+
+	// waitgroup/index counter
+	wgMap      map[uint64]*sync.WaitGroup
+	indexCount map[uint64]*AtomicCounter
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -109,7 +112,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		votes:                    0,
 		clientedVoted:            0,
 		logStore:                 logStore,
-		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(2000+rand.Intn(3000))),
+		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(500+rand.Intn(3000))),
 		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
 		heartBeatTimeout:         heartBeatTimeout,
 		heartBeatTimeoutDuration: 2000 * time.Millisecond,
@@ -126,6 +129,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clientHalf:               uint64(len(clients)) / 2,
 		reqAppend:                &AppendEntriesRequest{},
 		reqCommit:                &CommitLogRequest{},
+		wgMap:                    make(map[uint64]*sync.WaitGroup),
+		indexCount:               make(map[uint64]*AtomicCounter),
 	}
 }
 
@@ -172,8 +177,12 @@ func (r *raft) start() {
 				r.role = LEADER
 				go r.startHeartBeats()
 
+				// send logs to followers and self
+				//r.ApplyLog()
+
 				// run in goroutine to avoid stopping if ignored
 				go func() { r.leaderChan <- nil }()
+				r.startStream()
 				continue
 			}
 
@@ -284,10 +293,11 @@ func (r *raft) resetVotes() {
 
 func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 	latestIndex, err := r.broadCastAppendLog(data)
-	defer r.commitLock.Unlock()
 	if err != nil {
 		return nil, err
 	}
+
+	defer r.commitLock.Unlock()
 
 	var wg sync.WaitGroup
 	r.reqCommit.Index = latestIndex
@@ -315,10 +325,7 @@ func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 }
 
 func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
-	count := uint64(0)
-
 	ctx := context.Background()
-	var wg sync.WaitGroup
 
 	r.reqAppend.Term = r.logStore.GetLatestTerm()
 	r.reqAppend.Type = DATA_LOG
@@ -331,6 +338,13 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 		LeaderCommited: false,
 	}
 
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+
+	counter := &AtomicCounter{
+		value: 0,
+	}
+
 	r.applyLock.Lock()
 	defer r.applyLock.Unlock()
 
@@ -338,14 +352,17 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	r.reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
-	wg.Add(2)
+	r.wgMap[latestIndex] = wg
+
+	r.indexCount[latestIndex] = counter
+
 	for _, client := range r.clients {
 		go r.appendClient(ctx, client, &AppendEntriesRequest{
 			Index: latestIndex,
 			Term:  r.logStore.GetLatestTerm(),
 			Type:  DATA_LOG,
 			Data:  data,
-		}, &wg, &count)
+		}, wg)
 	}
 
 	if err := r.logStore.AppendLog(reqLog); err != nil {
@@ -354,8 +371,7 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	}
 
 	wg.Wait()
-
-	if count <= r.clientHalf {
+	if uint64(counter.value) <= r.clientHalf {
 		fmt.Println("failed to confirm log")
 		return 0, fmt.Errorf("failed to confirm log")
 	}
@@ -367,19 +383,15 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 
 }
 
-func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, count *uint64) {
-	defer wg.Done()
-	for i := 0; i < 3; i++ {
-		result, err := client.gClient.AppendEntries(ctx, req)
-		if err != nil {
-			// fmt.Println("client append err:", err)
-			continue
-		}
-
-		if result.Applied {
-			atomic.AddUint64(count, 1)
-		}
+func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup) {
+	if client.stream == nil {
+		wg.Done()
 		return
+	}
+
+	if err := client.stream.Send(req); err != nil {
+		fmt.Println("failed to send")
+		wg.Done()
 	}
 }
 
@@ -394,5 +406,58 @@ func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *C
 
 	if !result.Applied {
 		fmt.Println("client failed to append")
+	}
+}
+
+func (r *raft) startStream() {
+	for _, client := range r.clients {
+		go func(client *raftClient) {
+		START:
+			for {
+				if client.stream == nil {
+					break
+				}
+
+				in, err := client.stream.Recv()
+				if err != nil {
+					if strings.Contains(err.Error(), "error reading from server: EOF") {
+						fmt.Println("recv: err eof")
+						break
+					}
+
+					fmt.Println("recv: err continue", err)
+					continue
+				}
+
+				wg, ok := r.wgMap[in.Index]
+				if !ok {
+					//log here
+					continue
+				}
+
+				if !in.Applied {
+					wg.Done()
+					continue
+				}
+
+				if counter, ok := r.indexCount[in.Index]; ok {
+					counter.Increment()
+					wg.Done()
+				}
+			}
+
+			for {
+				stream, err := client.gClient.AppendEntriesStream(context.Background())
+				if err != nil {
+					time.Sleep(5 * time.Second)
+					fmt.Println("cannot find")
+				}
+
+				client.stream = stream
+				goto START
+
+			}
+		}(client)
+
 	}
 }

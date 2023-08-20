@@ -12,6 +12,7 @@ service RaftService {
    rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResult) {} 
    rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
    rpc CommitLog(CommitLogRequest) returns (CommitLogResult) {}
+   rpc AppendEntriesStream(stream AppendEntriesRequest) returns (stream AppendEntriesResult) {}
    // rpc UncommitEntry(UncommitEntry) returns (UncommitEntryResult) {} 
 }
 
@@ -39,6 +40,7 @@ message AppendEntriesRequest {
 
 message AppendEntriesResult {
    bool applied = 1;
+   uint64 index = 2;
 }
 
 message HeartBeatRequest {

@@ -1,5 +1,5 @@
 # raft
-A implementation of the Raft consenus algorithm
+A implementation of the Raft consenus algorithm, written in [Go](https://go.dev/) and utilising GRPC & protobuf to communicate between nodes to obtain consenus. 
 
 ## Building
 

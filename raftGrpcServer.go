@@ -2,6 +2,7 @@ package raft
 
 import (
 	context "context"
+	"io"
 	"time"
 
 	grpc "google.golang.org/grpc"
@@ -21,6 +22,7 @@ type raftGrpcServer interface {
 	HeartBeat(context.Context, *HeartBeatRequest) (*HeartBeatResult, error)
 	SendVote(context.Context, *SendVoteRequest) (*SendVoteResult, error)
 	CommitLog(context.Context, *CommitLogRequest) (*CommitLogResult, error)
+	AppendEntriesStream(AppendEntriesStreamServer) error
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -108,6 +110,33 @@ func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*Com
 	}, nil
 }
 
+func (r *raftServer) AppendEntriesStream(stream AppendEntriesStreamServer) error {
+	for {
+		in, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		err = r.logStore.AppendLog(Log{
+			Term:    in.Term,
+			Index:   in.Index,
+			LogType: in.Type,
+			Data:    in.Data,
+		})
+
+		if err := stream.Send(&AppendEntriesResult{
+			Applied: err == nil,
+			Index:   in.Index,
+		}); err != nil {
+			return err
+		}
+
+	}
+}
+
 // UnimplementedRaftServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedRaftServiceServer struct {
 }
@@ -131,6 +160,10 @@ func (UnimplementedRaftServiceServer) SendVote(context.Context, *SendVoteRequest
 
 func (UnimplementedRaftServiceServer) CommitLog(context.Context, *CommitLogRequest) (*CommitLogResult, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CommitLog not implemented")
+}
+
+func (UnimplementedRaftServiceServer) AppendEntriesStream(AppendEntriesStreamServer) error {
+	return status.Errorf(codes.Unimplemented, "method AppendEntriesStream not implemented")
 }
 
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
@@ -254,6 +287,32 @@ func _RaftService_CommitLog_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_AppendEntriesStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(raftGrpcServer).AppendEntriesStream(&raftServiceAppendEntriesStreamServer{stream})
+}
+
+type AppendEntriesStreamServer interface {
+	Send(*AppendEntriesResult) error
+	Recv() (*AppendEntriesRequest, error)
+	grpc.ServerStream
+}
+
+type raftServiceAppendEntriesStreamServer struct {
+	grpc.ServerStream
+}
+
+func (x *raftServiceAppendEntriesStreamServer) Send(m *AppendEntriesResult) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *raftServiceAppendEntriesStreamServer) Recv() (*AppendEntriesRequest, error) {
+	m := new(AppendEntriesRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -286,6 +345,13 @@ var raftService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RaftService_CommitLog_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "AppendEntriesStream",
+			Handler:       _RaftService_AppendEntriesStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "raft.proto",
 }
