@@ -1,15 +1,15 @@
 package raft
 
 // Using
-type LogType []byte
 
-var (
-	DATA_LOG LogType = []byte{0}
+const (
+	DATA_LOG uint64 = iota
+	RAFT_LOG
 )
 
 type CommitedLog struct {
 	Index uint64
-	Type  LogType
+	Type  uint64
 	Data  []byte
 }
 

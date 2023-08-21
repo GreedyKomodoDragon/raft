@@ -8,7 +8,7 @@ import (
 type Log struct {
 	Term           uint64
 	Index          uint64
-	LogType        LogType
+	LogType        uint64
 	Data           []byte
 	LeaderCommited bool
 }

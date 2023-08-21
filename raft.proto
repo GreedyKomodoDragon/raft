@@ -34,7 +34,7 @@ message RequestVotesResult {
 message AppendEntriesRequest {
    uint64 term = 1;
    uint64 index = 2;
-   bytes  type = 3;
+   uint64 type = 3;
    bytes  data = 4;
 }
 
@@ -51,7 +51,7 @@ message HeartBeatResult {
 
 message SendVoteRequest {
    bool voted = 1;
-   uint64 id  =2;
+   uint64 id = 2;
 }
  
 message SendVoteResult {

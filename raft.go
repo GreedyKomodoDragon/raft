@@ -29,7 +29,7 @@ type Result struct {
 
 type Raft interface {
 	Start(net.Listener)
-	ApplyLog([]byte) ([]byte, error)
+	ApplyLog([]byte, uint64) ([]byte, error)
 	LeaderChan() chan interface{}
 }
 
@@ -104,6 +104,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	}
 
 	heartBeatTimeout := time.Millisecond * 500
+	tOut := 500 + rand.Intn(6000)
 
 	return &raft{
 		clients:                  clients,
@@ -112,7 +113,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		votes:                    0,
 		clientedVoted:            0,
 		logStore:                 logStore,
-		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(500+rand.Intn(3000))),
+		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(tOut)),
 		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
 		heartBeatTimeout:         heartBeatTimeout,
 		heartBeatTimeoutDuration: 2000 * time.Millisecond,
@@ -152,7 +153,17 @@ func (r *raft) start() {
 		case t := <-r.heartBeatChan:
 			r.heartBeatTime = t
 
+			if r.role == CANDIDATE {
+				fmt.Println("Demoted to follower as found leader")
+				r.role = FOLLOWER
+			}
+
 		case event := <-r.voteReceived:
+			if r.role == LEADER {
+				fmt.Println("already leader so ignored")
+				continue
+			}
+
 			// if found another leader
 			if r.hasRecievedHeartbeat() || r.role == FOLLOWER {
 				fmt.Println("Demoted to follower as found leader")
@@ -169,25 +180,32 @@ func (r *raft) start() {
 			// if not enough nodes have voted wait
 			clientHalf := uint64(len(r.clients)) / 2
 
-			if r.clientedVoted < clientHalf || r.role == LEADER {
+			if r.clientedVoted < clientHalf {
+				fmt.Println("not enough votes found")
 				continue
 			}
 
-			if r.votes > clientHalf {
-				r.role = LEADER
-				go r.startHeartBeats()
-
-				// send logs to followers and self
-				//r.ApplyLog()
-
-				// run in goroutine to avoid stopping if ignored
-				go func() { r.leaderChan <- nil }()
-				r.startStream()
+			if r.votes < clientHalf {
+				fmt.Println("not enough votes in favour")
+				r.role = FOLLOWER
 				continue
 			}
 
-			// if not leader become a follower
-			r.role = FOLLOWER
+			r.role = LEADER
+			go r.startHeartBeats()
+			fmt.Println("became leader")
+
+			r.buildStreams()
+			r.startStream()
+
+			// send logs to followers and self
+			if _, err := r.ApplyLog([]byte{}, RAFT_LOG); err != nil {
+				fmt.Println("unable to append leader log", err)
+				continue
+			}
+
+			// run in goroutine to avoid stopping if ignored
+			go func() { r.leaderChan <- nil }()
 
 		case event := <-r.voteRequested:
 			client, err := r.getClientByID(event.Id)
@@ -291,13 +309,16 @@ func (r *raft) resetVotes() {
 	r.clientedVoted = 1
 }
 
-func (r *raft) ApplyLog(data []byte) ([]byte, error) {
-	latestIndex, err := r.broadCastAppendLog(data)
+func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
+	latestIndex, err := r.broadCastAppendLog(data, typ)
 	if err != nil {
 		return nil, err
 	}
 
 	defer r.commitLock.Unlock()
+	if typ == RAFT_LOG {
+		return nil, nil
+	}
 
 	var wg sync.WaitGroup
 	r.reqCommit.Index = latestIndex
@@ -312,7 +333,7 @@ func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 	// apply log
 	data, err = r.appApply.Apply(CommitedLog{
 		Index: latestIndex,
-		Type:  DATA_LOG,
+		Type:  typ,
 		Data:  data,
 	})
 
@@ -324,11 +345,11 @@ func (r *raft) ApplyLog(data []byte) ([]byte, error) {
 	return data, nil
 }
 
-func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
+func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 	ctx := context.Background()
 
 	r.reqAppend.Term = r.logStore.GetLatestTerm()
-	r.reqAppend.Type = DATA_LOG
+	r.reqAppend.Type = typ
 	r.reqAppend.Data = data
 
 	reqLog := Log{
@@ -340,10 +361,7 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
-
-	counter := &AtomicCounter{
-		value: 0,
-	}
+	counter := NewAtomicCounter()
 
 	r.applyLock.Lock()
 	defer r.applyLock.Unlock()
@@ -362,7 +380,7 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 			Term:  r.logStore.GetLatestTerm(),
 			Type:  DATA_LOG,
 			Data:  data,
-		}, wg)
+		}, wg, counter)
 	}
 
 	if err := r.logStore.AppendLog(reqLog); err != nil {
@@ -371,8 +389,8 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 	}
 
 	wg.Wait()
-	if uint64(counter.value) <= r.clientHalf {
-		fmt.Println("failed to confirm log")
+	if uint64(counter.IdCount()) <= r.clientHalf-1 {
+		fmt.Println("failed to confirm log, count is:", counter.IdCount())
 		return 0, fmt.Errorf("failed to confirm log")
 	}
 
@@ -383,8 +401,9 @@ func (r *raft) broadCastAppendLog(data []byte) (uint64, error) {
 
 }
 
-func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup) {
+func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, atom *AtomicCounter) {
 	if client.stream == nil {
+		fmt.Println("no stream found")
 		wg.Done()
 		return
 	}
@@ -392,7 +411,19 @@ func (r *raft) appendClient(ctx context.Context, client *raftClient, req *Append
 	if err := client.stream.Send(req); err != nil {
 		fmt.Println("failed to send")
 		wg.Done()
+		return
 	}
+
+	// timeout
+	go func() {
+		time.Sleep(3 * time.Second)
+		if atom.HasId(client.id) {
+			return
+		}
+
+		atom.AddIdOnly(client.id)
+		wg.Done()
+	}()
 }
 
 func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {
@@ -409,9 +440,25 @@ func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *C
 	}
 }
 
+func (r *raft) buildStreams() {
+	for _, client := range r.clients {
+		for i := 0; i < 3; i++ {
+			stream, err := client.gClient.AppendEntriesStream(context.Background())
+			if err != nil {
+				time.Sleep(2 * time.Second)
+				fmt.Println("cannot find client, err:", err)
+				continue
+			}
+
+			client.stream = stream
+		}
+	}
+}
+
 func (r *raft) startStream() {
 	for _, client := range r.clients {
 		go func(client *raftClient) {
+			defer fmt.Println("exited the loop")
 		START:
 			for {
 				if client.stream == nil {
@@ -429,28 +476,38 @@ func (r *raft) startStream() {
 					continue
 				}
 
+				counter, ok := r.indexCount[in.Index]
+				if !ok {
+					fmt.Println("not found counter")
+					continue
+				}
+
+				if counter.HasId(client.id) {
+					fmt.Println("already has id")
+					continue
+				}
+
 				wg, ok := r.wgMap[in.Index]
 				if !ok {
-					//log here
+					fmt.Println("not found wg")
 					continue
 				}
 
 				if !in.Applied {
+					fmt.Println("not applied")
 					wg.Done()
 					continue
 				}
 
-				if counter, ok := r.indexCount[in.Index]; ok {
-					counter.Increment()
-					wg.Done()
-				}
+				counter.Increment(client.id)
+				wg.Done()
 			}
 
 			for {
 				stream, err := client.gClient.AppendEntriesStream(context.Background())
 				if err != nil {
-					time.Sleep(5 * time.Second)
-					fmt.Println("cannot find")
+					time.Sleep(2 * time.Second)
+					fmt.Println("cannot find client, err:", err)
 				}
 
 				client.stream = stream

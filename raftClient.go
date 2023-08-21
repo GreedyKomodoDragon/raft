@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"context"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -24,17 +22,13 @@ func newRaftClient(address string, id uint64) (*raftClient, error) {
 	}
 
 	gClient := newRaftServiceClient(conn)
-	stream, err := gClient.AppendEntriesStream(context.Background())
-	if err != nil {
-		stream = nil
-	}
 
 	return &raftClient{
 		gClient: gClient,
 		conn:    conn,
 		address: address,
 		id:      id,
-		stream:  stream,
+		stream:  nil,
 	}, nil
 
 }
