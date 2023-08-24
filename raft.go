@@ -90,6 +90,10 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 
 	appApply := &StdOutApply{}
 
+	if err := logStore.RestoreLogs(appApply); err != nil {
+		fmt.Println("unable to read snapshots")
+	}
+
 	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply))
 
 	clients := []*raftClient{}
@@ -331,10 +335,10 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	}
 
 	// apply log
-	data, err = r.appApply.Apply(CommitedLog{
-		Index: latestIndex,
-		Type:  typ,
-		Data:  data,
+	data, err = r.appApply.Apply(Log{
+		Index:   latestIndex,
+		Data:    data,
+		LogType: typ,
 	})
 
 	if err != nil {

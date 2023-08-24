@@ -7,20 +7,14 @@ const (
 	RAFT_LOG
 )
 
-type CommitedLog struct {
-	Index uint64
-	Type  uint64
-	Data  []byte
-}
-
 type ApplicationApply interface {
-	Apply(CommitedLog) ([]byte, error)
+	Apply(Log) ([]byte, error)
 }
 
 type StdOutApply struct {
 }
 
-func (s *StdOutApply) Apply(log CommitedLog) ([]byte, error) {
+func (s *StdOutApply) Apply(log Log) ([]byte, error) {
 	// fmt.Println("log applied:", log.Index, string(log.Data))
 	return nil, nil
 }

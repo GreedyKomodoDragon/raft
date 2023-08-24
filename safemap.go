@@ -19,3 +19,12 @@ func (sm *safeMap) Get(key uint64) (*Log, bool) {
 	val, exists := sm.data[key]
 	return val, exists
 }
+
+func (sm *safeMap) DeleteRange(start, finish uint64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := start; i <= finish; i++ {
+		delete(sm.data, i)
+	}
+}

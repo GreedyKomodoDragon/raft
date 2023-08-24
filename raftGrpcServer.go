@@ -93,10 +93,10 @@ func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*Com
 		}, err
 	}
 
-	if _, err = r.appApply.Apply(CommitedLog{
-		Index: req.Index,
-		Type:  DATA_LOG,
-		Data:  log.Data,
+	if _, err = r.appApply.Apply(Log{
+		Index:   req.Index,
+		LogType: DATA_LOG,
+		Data:    log.Data,
 	}); err != nil {
 		return &CommitLogResult{
 			Applied: false,
