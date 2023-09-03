@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,12 @@ const (
 	FILE_FORMAT string = "node_data/logs/%v-%v"
 )
 
+var (
+	ErrNoLogs         = errors.New("there are no logs")
+	ErrLogFormatWrong = errors.New("invalid log file parsed: not matching #-# format")
+	ErrKeyNotFound    = errors.New("key not found")
+)
+
 type Log struct {
 	Term           uint64
 	Index          uint64
@@ -31,18 +38,22 @@ type Log struct {
 type LogStore interface {
 	AppendLog(Log) error
 	GetLog(uint64) (*Log, error)
-	UpdateCommited(uint64) error
+	SetLog(uint64, *Log) error
+	UpdateCommited(uint64) (bool, error)
 	IncrementIndex()
 	IncrementTerm()
 	GetLatestIndex() uint64
 	GetLatestTerm() uint64
 	RestoreLogs(ApplicationApply) error
+	IsPiping() bool
+	SetPiping(bool)
 }
 
 type logStore struct {
-	logs  *safeMap
-	index uint64
-	term  uint64
+	logs   *safeMap
+	index  uint64
+	term   uint64
+	piping bool
 
 	threshold  uint64
 	currBatch  uint64
@@ -61,10 +72,11 @@ func NewLogStore() (LogStore, error) {
 			make(map[uint64]*Log),
 			sync.RWMutex{},
 		},
-		index:      1,
+		index:      0,
 		term:       0,
 		threshold:  2000,
 		persistMux: &sync.Mutex{},
+		piping:     false,
 	}, nil
 }
 
@@ -74,7 +86,17 @@ func (l *logStore) AppendLog(log Log) error {
 	}
 
 	l.logs.Set(log.Index, &log)
+
 	go l.persistLog()
+	return nil
+}
+
+func (l *logStore) SetLog(index uint64, log *Log) error {
+	if l.logs == nil {
+		return fmt.Errorf("missing slice")
+	}
+
+	l.logs.Set(index, log)
 	return nil
 }
 
@@ -84,25 +106,135 @@ func (l *logStore) GetLog(index uint64) (*Log, error) {
 	}
 
 	log, ok := l.logs.Get(index)
-	if !ok {
-		return nil, fmt.Errorf("cannot find log", index)
+	if ok {
+		return log, nil
 	}
 
-	return log, nil
+	l.persistMux.Lock()
+	defer l.persistMux.Unlock()
+
+	// go to disk
+	entries, err := os.ReadDir(LOG_DIR)
+	if err != nil {
+		return nil, err
+	}
+
+	name := ""
+	for _, entry := range entries {
+		splitEntry := strings.Split(entry.Name(), HYPEN)
+		if len(splitEntry) < 2 {
+			return nil, ErrLogFormatWrong
+		}
+
+		l, err := strconv.ParseUint(splitEntry[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		h, err := strconv.ParseUint(splitEntry[1], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		if h > index && index >= l {
+			name = LOG_DIR + "/" + entry.Name()
+			break
+		}
+	}
+
+	if len(name) == 0 {
+		return nil, fmt.Errorf("index missing: %v", index)
+	}
+
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	if err := l.restoreLogs(f, name); err != nil {
+		return nil, err
+	}
+
+	if log, ok := l.logs.Get(index); ok {
+		return log, nil
+	}
+
+	return nil, fmt.Errorf("cannot find log: %v", index)
 }
 
-func (l *logStore) UpdateCommited(index uint64) error {
+func (l *logStore) restoreLogs(rClose io.ReadCloser, name string) error {
+	bts := []byte{}
+	buffer := make([]byte, 1024)
+
+	for {
+		n, err := rClose.Read(buffer)
+		if err != nil && err != io.EOF {
+			return err
+		}
+
+		if n == 0 {
+			break
+		}
+
+		bts = append(bts, buffer...)
+
+		// TODO: find a better way that does not require two traverisals
+		indexes := findIndexes(bts, BREAK_SYMBOL)
+		if len(indexes) == 0 {
+			continue
+		}
+
+		previous := 0
+
+		for i := 0; i < len(indexes); i++ {
+			subSlice := bts[previous:indexes[i]]
+			if len(subSlice) == 0 {
+				continue
+			}
+
+			if err := l.extractLog(&subSlice); err == nil {
+				previous = indexes[i] + len(BREAK_SYMBOL)
+			}
+		}
+
+		bts = bts[previous:]
+	}
+
+	return nil
+}
+
+func (l *logStore) extractLog(by *[]byte) error {
+	payload := Log{}
+	if err := msgpack.Unmarshal(*by, &payload); err != nil {
+		return err
+	}
+
+	l.logs.Set(payload.Index, &payload)
+	return nil
+}
+
+func (l *logStore) UpdateCommited(index uint64) (bool, error) {
 	if l.logs == nil {
-		return fmt.Errorf("missing slice")
+		return false, fmt.Errorf("missing slice")
 	}
 
 	log, ok := l.logs.Get(index)
 	if !ok {
-		return fmt.Errorf("cannot find log: %v", index)
+		return false, fmt.Errorf("cannot find log: %v", index)
 	}
 
 	log.LeaderCommited = true
-	return nil
+
+	// TODO: breaks seperation/AppendLog side effect introduced so fix!
+	// Also very brittle
+	if log.Index-1 != l.index && !l.piping {
+		fmt.Println("missing log!", log.Index, l.index)
+		l.piping = true
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // writes the current batch of logs to disk
@@ -177,7 +309,7 @@ func (l *logStore) persistLog() error {
 		for i := lower; i <= upper; i++ {
 			log, err := l.GetLog(i)
 			if err != nil {
-				fmt.Println("failed to get log")
+				fmt.Println("failed to get log when persisting:", err)
 				return err
 			}
 
@@ -266,7 +398,7 @@ func (l *logStore) restore(app ApplicationApply, rClose io.ReadCloser) error {
 				continue
 			}
 
-			if err := l.extractLog(app, &subSlice); err == nil {
+			if err := l.extractApplyLog(app, &subSlice); err == nil {
 				previous = indexes[i] + len(BREAK_SYMBOL)
 			}
 		}
@@ -277,7 +409,7 @@ func (l *logStore) restore(app ApplicationApply, rClose io.ReadCloser) error {
 	return nil
 }
 
-func (l *logStore) extractLog(app ApplicationApply, data *[]byte) error {
+func (l *logStore) extractApplyLog(app ApplicationApply, data *[]byte) error {
 	log := Log{}
 	if err := msgpack.Unmarshal(*data, &log); err != nil {
 		return err
@@ -317,6 +449,14 @@ func (l *logStore) GetLatestTerm() uint64 {
 
 func (l *logStore) deleteRange(start, finish uint64) {
 	l.logs.DeleteRange(start, finish)
+}
+
+func (l *logStore) IsPiping() bool {
+	return l.piping
+}
+
+func (l *logStore) SetPiping(isPiping bool) {
+	l.piping = isPiping
 }
 
 func findIndexes(largerSlice, smallerSlice []byte) []int {

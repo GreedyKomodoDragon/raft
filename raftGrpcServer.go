@@ -2,6 +2,7 @@ package raft
 
 import (
 	context "context"
+	"fmt"
 	"io"
 	"time"
 
@@ -9,11 +10,6 @@ import (
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
 )
-
-type voteReceivedInfo struct {
-	Id    string
-	Voted bool
-}
 
 type raftGrpcServer interface {
 	GetStatus(context.Context, *StatusRequest) (*StatusResult, error)
@@ -23,11 +19,13 @@ type raftGrpcServer interface {
 	SendVote(context.Context, *SendVoteRequest) (*SendVoteResult, error)
 	CommitLog(context.Context, *CommitLogRequest) (*CommitLogResult, error)
 	AppendEntriesStream(AppendEntriesStreamServer) error
+	PipeEntries(PipeEntriesServer) error
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
 type raftServer struct {
-	logStore LogStore
+	logStore     LogStore
+	electManager *electionManager
 
 	// heartbeat
 	hbResult      *HeartBeatResult
@@ -41,7 +39,8 @@ type raftServer struct {
 	UnimplementedRaftServiceServer
 }
 
-func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequested chan *RequestVotesRequest, voteReceived chan *SendVoteRequest, appApply ApplicationApply) raftGrpcServer {
+func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequested chan *RequestVotesRequest,
+	voteReceived chan *SendVoteRequest, appApply ApplicationApply, electManager *electionManager) raftGrpcServer {
 	return &raftServer{
 		logStore:      logStore,
 		heartbeatChan: heartBeatChan,
@@ -49,6 +48,7 @@ func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequ
 		voteRequested: voteRequested,
 		voteReceived:  voteReceived,
 		appApply:      appApply,
+		electManager:  electManager,
 	}
 }
 
@@ -62,6 +62,10 @@ func (r *raftServer) RequestVotes(ctx context.Context, req *RequestVotesRequest)
 }
 
 func (r *raftServer) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResult, error) {
+	if !r.electManager.foundLeader {
+		return &AppendEntriesResult{Applied: false}, nil
+	}
+
 	if err := r.logStore.AppendLog(Log{
 		Term:    req.Term,
 		Index:   req.Index,
@@ -86,11 +90,37 @@ func (r *raftServer) SendVote(ctx context.Context, req *SendVoteRequest) (*SendV
 }
 
 func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*CommitLogResult, error) {
+	if !r.electManager.foundLeader {
+		fmt.Println("leader not found yet")
+		return &CommitLogResult{
+			Applied: false,
+		}, nil
+	}
+
 	log, err := r.logStore.GetLog(req.Index)
 	if err != nil {
 		return &CommitLogResult{
 			Applied: false,
 		}, err
+	}
+
+	log.LeaderCommited = true
+
+	// return early if piping
+	if r.logStore.IsPiping() {
+		return &CommitLogResult{
+			Applied: true,
+		}, nil
+	}
+
+	// request the pipeling to begin
+	if log.Index-1 > r.logStore.GetLatestIndex() {
+		r.logStore.SetPiping(true)
+
+		return &CommitLogResult{
+			Applied: true,
+			Missing: 1,
+		}, nil
 	}
 
 	if _, err = r.appApply.Apply(Log{
@@ -137,6 +167,29 @@ func (r *raftServer) AppendEntriesStream(stream AppendEntriesStreamServer) error
 	}
 }
 
+func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
+	for {
+		in, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if err := r.logStore.SetLog(in.Index, &Log{
+			Index:          in.Index,
+			Data:           in.Data,
+			Term:           in.Term,
+			LogType:        in.Type,
+			LeaderCommited: in.Commited,
+		}); err != nil {
+			return fmt.Errorf("failed to set log")
+		}
+	}
+}
+
 // UnimplementedRaftServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedRaftServiceServer struct {
 }
@@ -164,6 +217,10 @@ func (UnimplementedRaftServiceServer) CommitLog(context.Context, *CommitLogReque
 
 func (UnimplementedRaftServiceServer) AppendEntriesStream(AppendEntriesStreamServer) error {
 	return status.Errorf(codes.Unimplemented, "method AppendEntriesStream not implemented")
+}
+
+func (UnimplementedRaftServiceServer) PipeEntries(PipeEntriesServer) error {
+	return status.Errorf(codes.Unimplemented, "method PipeEntries not implemented")
 }
 
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
@@ -313,6 +370,32 @@ func (x *raftServiceAppendEntriesStreamServer) Recv() (*AppendEntriesRequest, er
 	return m, nil
 }
 
+func _RaftService_PipeEntries_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(raftGrpcServer).PipeEntries(&raftServicePipeEntriesServer{stream})
+}
+
+type PipeEntriesServer interface {
+	Send(*PipeEntriesResponse) error
+	Recv() (*PipeEntriesRequest, error)
+	grpc.ServerStream
+}
+
+type raftServicePipeEntriesServer struct {
+	grpc.ServerStream
+}
+
+func (x *raftServicePipeEntriesServer) Send(m *PipeEntriesResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *raftServicePipeEntriesServer) Recv() (*PipeEntriesRequest, error) {
+	m := new(PipeEntriesRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -349,6 +432,12 @@ var raftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "AppendEntriesStream",
 			Handler:       _RaftService_AppendEntriesStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PipeEntries",
+			Handler:       _RaftService_PipeEntries_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

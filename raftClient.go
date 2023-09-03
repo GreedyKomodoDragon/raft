@@ -6,11 +6,13 @@ import (
 )
 
 type raftClient struct {
-	gClient raftServiceClient
-	conn    *grpc.ClientConn
-	address string
-	id      uint64
-	stream  AppendEntriesStreamClient
+	gClient    raftServiceClient
+	conn       *grpc.ClientConn
+	address    string
+	id         uint64
+	stream     AppendEntriesStreamClient
+	pipestream pipeEntriesClient
+	piping     bool
 }
 
 func newRaftClient(address string, id uint64) (*raftClient, error) {
@@ -24,11 +26,13 @@ func newRaftClient(address string, id uint64) (*raftClient, error) {
 	gClient := newRaftServiceClient(conn)
 
 	return &raftClient{
-		gClient: gClient,
-		conn:    conn,
-		address: address,
-		id:      id,
-		stream:  nil,
+		gClient:    gClient,
+		conn:       conn,
+		address:    address,
+		id:         id,
+		stream:     nil,
+		pipestream: nil,
+		piping:     false,
 	}, nil
 
 }

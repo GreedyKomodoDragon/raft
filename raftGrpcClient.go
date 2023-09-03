@@ -14,6 +14,7 @@ type raftServiceClient interface {
 	SendVote(ctx context.Context, in *SendVoteRequest, opts ...grpc.CallOption) (*SendVoteResult, error)
 	CommitLog(ctx context.Context, in *CommitLogRequest, opts ...grpc.CallOption) (*CommitLogResult, error)
 	AppendEntriesStream(ctx context.Context, opts ...grpc.CallOption) (AppendEntriesStreamClient, error)
+	PipeEntries(ctx context.Context, opts ...grpc.CallOption) (pipeEntriesClient, error)
 }
 
 type raftGrpcClient struct {
@@ -87,6 +88,15 @@ func (c *raftGrpcClient) AppendEntriesStream(ctx context.Context, opts ...grpc.C
 	return x, nil
 }
 
+func (c *raftGrpcClient) PipeEntries(ctx context.Context, opts ...grpc.CallOption) (pipeEntriesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &raftService_ServiceDesc.Streams[1], "/raft.RaftService/PipeEntries", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &raftServicePipeEntriesClient{stream}
+	return x, nil
+}
+
 type AppendEntriesStreamClient interface {
 	Send(*AppendEntriesRequest) error
 	Recv() (*AppendEntriesResult, error)
@@ -103,6 +113,28 @@ func (x *raftServiceAppendEntriesStreamClient) Send(m *AppendEntriesRequest) err
 
 func (x *raftServiceAppendEntriesStreamClient) Recv() (*AppendEntriesResult, error) {
 	m := new(AppendEntriesResult)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+type pipeEntriesClient interface {
+	Send(*PipeEntriesRequest) error
+	Recv() (*PipeEntriesResponse, error)
+	grpc.ClientStream
+}
+
+type raftServicePipeEntriesClient struct {
+	grpc.ClientStream
+}
+
+func (x *raftServicePipeEntriesClient) Send(m *PipeEntriesRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *raftServicePipeEntriesClient) Recv() (*PipeEntriesResponse, error) {
+	m := new(PipeEntriesResponse)
 	if err := x.ClientStream.RecvMsg(m); err != nil {
 		return nil, err
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,16 +35,10 @@ type Raft interface {
 type raft struct {
 	clients []*raftClient
 	grpc    *grpc.Server
-	role    role
 	id      uint64
 
 	// constants
 	clientHalf uint64
-
-	// election
-	votes         uint64
-	clientedVoted uint64
-	electionTimer *time.Timer
 
 	// heart beat
 	heartbeatTimer           *time.Timer
@@ -57,7 +50,6 @@ type raft struct {
 	voteRequested chan *RequestVotesRequest
 	voteReceived  chan *SendVoteRequest
 	heartBeatChan chan time.Time
-	applyedLogs   chan *Result
 
 	logStore LogStore
 
@@ -78,6 +70,9 @@ type raft struct {
 	// waitgroup/index counter
 	wgMap      map[uint64]*sync.WaitGroup
 	indexCount map[uint64]*AtomicCounter
+
+	// election
+	electManager *electionManager
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
@@ -94,7 +89,9 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		fmt.Println("unable to read snapshots")
 	}
 
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply))
+	elect := newElectionManager(logStore)
+
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply, elect))
 
 	clients := []*raftClient{}
 	for _, server := range servers {
@@ -108,16 +105,11 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	}
 
 	heartBeatTimeout := time.Millisecond * 500
-	tOut := 500 + rand.Intn(6000)
 
 	return &raft{
 		clients:                  clients,
 		grpc:                     grpcServer,
-		role:                     FOLLOWER,
-		votes:                    0,
-		clientedVoted:            0,
 		logStore:                 logStore,
-		electionTimer:            time.NewTimer(time.Millisecond * time.Duration(tOut)),
 		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
 		heartBeatTimeout:         heartBeatTimeout,
 		heartBeatTimeoutDuration: 2000 * time.Millisecond,
@@ -127,7 +119,6 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		voteRequested:            votesRequestedChan,
 		id:                       id,
 		leaderChan:               make(chan interface{}, 1),
-		applyedLogs:              make(chan *Result, 5),
 		appApply:                 appApply,
 		applyLock:                &sync.Mutex{},
 		commitLock:               &sync.Mutex{},
@@ -136,6 +127,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		reqCommit:                &CommitLogRequest{},
 		wgMap:                    make(map[uint64]*sync.WaitGroup),
 		indexCount:               make(map[uint64]*AtomicCounter),
+		electManager:             elect,
 	}
 }
 
@@ -156,46 +148,49 @@ func (r *raft) start() {
 		select {
 		case t := <-r.heartBeatChan:
 			r.heartBeatTime = t
+			r.electManager.foundLeader = true
 
-			if r.role == CANDIDATE {
+			if r.electManager.currentState == CANDIDATE {
 				fmt.Println("Demoted to follower as found leader")
-				r.role = FOLLOWER
+				r.electManager.currentState = FOLLOWER
+
 			}
 
 		case event := <-r.voteReceived:
-			if r.role == LEADER {
+			if r.electManager.currentState == LEADER {
 				fmt.Println("already leader so ignored")
 				continue
 			}
 
 			// if found another leader
-			if r.hasRecievedHeartbeat() || r.role == FOLLOWER {
+			if r.hasRecievedHeartbeat() || r.electManager.currentState == FOLLOWER {
 				fmt.Println("Demoted to follower as found leader")
-				r.role = FOLLOWER
+				r.electManager.currentState = FOLLOWER
 				continue
 			}
 
 			if event.Voted {
-				r.votes++
+				fmt.Println("vote found:", event.Id)
+				r.electManager.votes++
 			}
 
-			r.clientedVoted++
+			r.electManager.clientedVoted++
 
 			// if not enough nodes have voted wait
 			clientHalf := uint64(len(r.clients)) / 2
 
-			if r.clientedVoted < clientHalf {
+			if r.electManager.clientedVoted < clientHalf {
 				fmt.Println("not enough votes found")
 				continue
 			}
 
-			if r.votes < clientHalf {
+			if r.electManager.votes < clientHalf {
 				fmt.Println("not enough votes in favour")
-				r.role = FOLLOWER
+				r.electManager.currentState = FOLLOWER
 				continue
 			}
 
-			r.role = LEADER
+			r.electManager.currentState = LEADER
 			go r.startHeartBeats()
 			fmt.Println("became leader")
 
@@ -217,6 +212,7 @@ func (r *raft) start() {
 				fmt.Println("couldn't find client who voted", event.Id)
 			}
 
+			fmt.Println("voted:", r.sendVote(event.Index, event.Term))
 			if _, err := client.gClient.SendVote(context.Background(), &SendVoteRequest{
 				Voted: r.sendVote(event.Index, event.Term),
 				Id:    r.id,
@@ -224,25 +220,26 @@ func (r *raft) start() {
 				fmt.Println("unable to send vote to node, err=", err)
 			}
 
-		case <-r.electionTimer.C:
+		case <-r.electManager.electionTimer.C:
 			// only begin election if no heartbeat has started
 			if r.hasRecievedHeartbeat() {
-				r.electionTimer.Reset(time.Millisecond * time.Duration(rand.Intn(3000)))
+				r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(rand.Intn(6000)))
 				continue
 			}
 
-			if r.role == LEADER {
+			if r.electManager.currentState == LEADER {
 				continue
 			}
 
+			r.electManager.foundLeader = false
 			r.logStore.IncrementTerm()
-			r.role = CANDIDATE
+			r.electManager.currentState = CANDIDATE
 
 			fmt.Println("Starting/reseting election!")
-			r.resetVotes()
+			r.electManager.resetVotes()
 			r.broadCastVotes()
 
-			r.electionTimer.Reset(time.Millisecond * time.Duration(3000))
+			r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(6000))
 		}
 	}
 }
@@ -285,9 +282,13 @@ func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
 	// if recieved heartbeat already has a leader
 	// if grant vote only if the candidate has higher term
 	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
-	return !r.hasRecievedHeartbeat() &&
-		(lastTerm > r.logStore.GetLatestTerm() ||
-			(lastTerm == r.logStore.GetLatestTerm() && lastIndex >= r.logStore.GetLatestIndex()))
+
+	fmt.Println("send vote:", "lastTerm:", lastTerm, "GetLatestTerm()", r.logStore.GetLatestTerm(), "lastIndex:", lastIndex, "GetLatestIndex():", r.logStore.GetLatestIndex(), "condition:",
+		r.electManager.currentState != LEADER && (lastTerm > r.logStore.GetLatestTerm() ||
+			(lastTerm == r.logStore.GetLatestTerm() && lastIndex > r.logStore.GetLatestIndex())))
+
+	return !r.electManager.foundLeader && r.electManager.currentState != LEADER && (lastTerm > r.logStore.GetLatestTerm() ||
+		(lastTerm == r.logStore.GetLatestTerm() && lastIndex > r.logStore.GetLatestIndex()))
 }
 
 func (r *raft) getClientByID(id uint64) (*raftClient, error) {
@@ -306,11 +307,6 @@ func (r *raft) getClientByID(id uint64) (*raftClient, error) {
 
 func (r *raft) hasRecievedHeartbeat() bool {
 	return time.Since(r.heartBeatTime) < time.Second*2
-}
-
-func (r *raft) resetVotes() {
-	r.votes = 1
-	r.clientedVoted = 1
 }
 
 func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
@@ -375,10 +371,14 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 	reqLog.Index = latestIndex
 
 	r.wgMap[latestIndex] = wg
-
 	r.indexCount[latestIndex] = counter
 
 	for _, client := range r.clients {
+		if client.stream == nil {
+			wg.Done()
+			continue
+		}
+
 		go r.appendClient(ctx, client, &AppendEntriesRequest{
 			Index: latestIndex,
 			Term:  r.logStore.GetLatestTerm(),
@@ -406,14 +406,8 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 }
 
 func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, atom *AtomicCounter) {
-	if client.stream == nil {
-		fmt.Println("no stream found")
-		wg.Done()
-		return
-	}
-
 	if err := client.stream.Send(req); err != nil {
-		fmt.Println("failed to send")
+		// fmt.Println("failed to send:", err)
 		wg.Done()
 		return
 	}
@@ -432,15 +426,21 @@ func (r *raft) appendClient(ctx context.Context, client *raftClient, req *Append
 
 func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
-	result, err := client.gClient.CommitLog(ctx, commitReq)
 
+	result, err := client.gClient.CommitLog(ctx, commitReq)
 	if err != nil {
-		fmt.Println("client append err:", err)
+		// fmt.Println("client append err:", err)
 		return
 	}
 
+	if result.Missing != 0 && !client.piping {
+		// start piping logs
+		fmt.Println("needs to start piping now")
+		go r.startPipingStream(client, result.Missing, commitReq.Index)
+	}
+
 	if !result.Applied {
-		fmt.Println("client failed to append")
+		fmt.Println("client failed to commit:", commitReq.Index, client.id)
 	}
 }
 
@@ -471,13 +471,7 @@ func (r *raft) startStream() {
 
 				in, err := client.stream.Recv()
 				if err != nil {
-					if strings.Contains(err.Error(), "error reading from server: EOF") {
-						fmt.Println("recv: err eof")
-						break
-					}
-
-					fmt.Println("recv: err continue", err)
-					continue
+					break
 				}
 
 				counter, ok := r.indexCount[in.Index]
@@ -521,4 +515,53 @@ func (r *raft) startStream() {
 		}(client)
 
 	}
+}
+
+func (r *raft) startPipingStream(client *raftClient, startIndex, endIndex uint64) error {
+	// reset once finished
+	defer func() {
+		client.pipestream = nil
+		client.piping = false
+	}()
+
+	current := startIndex
+
+	for i := 0; client.pipestream == nil && i < 3; i++ {
+		stream, err := client.gClient.PipeEntries(context.Background())
+		if err == nil {
+			client.pipestream = stream
+			break
+		}
+
+		if i == 2 {
+			return err
+		}
+
+		time.Sleep(time.Second)
+		fmt.Println("cannot find client, err:", err)
+	}
+
+	for current <= endIndex {
+		log, err := r.logStore.GetLog(current)
+		if err != nil {
+			fmt.Println("cannot find log:", current, err)
+			return err
+		}
+
+		if err := client.pipestream.Send(&PipeEntriesRequest{
+			Index:    current,
+			Data:     log.Data,
+			Commited: log.LeaderCommited,
+			Term:     log.Term,
+			Type:     log.LogType,
+		}); err != nil {
+			fmt.Println("err:", err)
+			return err
+		}
+
+		fmt.Println("piped:", current)
+		current++
+	}
+
+	return nil
 }

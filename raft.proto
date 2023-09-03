@@ -13,6 +13,7 @@ service RaftService {
    rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
    rpc CommitLog(CommitLogRequest) returns (CommitLogResult) {}
    rpc AppendEntriesStream(stream AppendEntriesRequest) returns (stream AppendEntriesResult) {}
+   rpc PipeEntries(stream PipeEntriesRequest) returns (stream PipeEntriesResponse) {}
    // rpc UncommitEntry(UncommitEntry) returns (UncommitEntryResult) {} 
 }
 
@@ -62,5 +63,18 @@ message CommitLogRequest {
 }
  
 message CommitLogResult {
+   bool applied = 1;
+   uint64 missing = 2;
+}
+
+message PipeEntriesRequest {
+   uint64 term = 1;
+   uint64 index = 2;
+   uint64 type = 3;
+   bytes  data = 4;
+   bool commited = 5;
+}
+ 
+message PipeEntriesResponse {
    bool applied = 1;
 }
