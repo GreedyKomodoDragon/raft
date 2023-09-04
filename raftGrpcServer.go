@@ -115,11 +115,12 @@ func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*Com
 
 	// request the pipeling to begin
 	if log.Index-1 > r.logStore.GetLatestIndex() {
+		fmt.Println("request piping")
 		r.logStore.SetPiping(true)
 
 		return &CommitLogResult{
 			Applied: true,
-			Missing: 1,
+			Missing: r.logStore.GetLatestIndex(),
 		}, nil
 	}
 
@@ -168,13 +169,16 @@ func (r *raftServer) AppendEntriesStream(stream AppendEntriesStreamServer) error
 }
 
 func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
+	first := uint64(0)
 	for {
 		in, err := stream.Recv()
 		if err == io.EOF {
+			fmt.Println("finished piping")
 			return nil
 		}
 
 		if err != nil {
+			fmt.Println("piping err stream:", err)
 			return err
 		}
 
@@ -185,8 +189,20 @@ func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
 			LogType:        in.Type,
 			LeaderCommited: in.Commited,
 		}); err != nil {
+			fmt.Println("piping err set:", err)
 			return fmt.Errorf("failed to set log")
 		}
+
+		if first == 0 {
+			first = in.Index
+			defer func() {
+				fmt.Println("applying from:", first)
+				go r.logStore.ApplyFrom(first, r.appApply)
+			}()
+
+		}
+
+		fmt.Println("piping")
 	}
 }
 

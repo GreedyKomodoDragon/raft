@@ -122,7 +122,7 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		appApply:                 appApply,
 		applyLock:                &sync.Mutex{},
 		commitLock:               &sync.Mutex{},
-		clientHalf:               uint64(len(clients)) / 2,
+		clientHalf:               uint64(len(clients))/2 + 1,
 		reqAppend:                &AppendEntriesRequest{},
 		reqCommit:                &CommitLogRequest{},
 		wgMap:                    make(map[uint64]*sync.WaitGroup),
@@ -176,19 +176,18 @@ func (r *raft) start() {
 
 			r.electManager.clientedVoted++
 
-			// if not enough nodes have voted wait
-			clientHalf := uint64(len(r.clients)) / 2
-
-			if r.electManager.clientedVoted < clientHalf {
+			if r.electManager.clientedVoted < r.clientHalf {
 				fmt.Println("not enough votes found")
 				continue
 			}
 
-			if r.electManager.votes < clientHalf {
+			if r.electManager.votes < r.clientHalf {
 				fmt.Println("not enough votes in favour")
 				r.electManager.currentState = FOLLOWER
 				continue
 			}
+
+			fmt.Println("results:", r.electManager.votes, r.clientHalf)
 
 			r.electManager.currentState = LEADER
 			go r.startHeartBeats()
@@ -282,11 +281,7 @@ func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
 	// if recieved heartbeat already has a leader
 	// if grant vote only if the candidate has higher term
 	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
-
-	fmt.Println("send vote:", "lastTerm:", lastTerm, "GetLatestTerm()", r.logStore.GetLatestTerm(), "lastIndex:", lastIndex, "GetLatestIndex():", r.logStore.GetLatestIndex(), "condition:",
-		r.electManager.currentState != LEADER && (lastTerm > r.logStore.GetLatestTerm() ||
-			(lastTerm == r.logStore.GetLatestTerm() && lastIndex > r.logStore.GetLatestIndex())))
-
+	// why have !r.electManager.foundLeader? it allows a much easier comparsion to occur
 	return !r.electManager.foundLeader && r.electManager.currentState != LEADER && (lastTerm > r.logStore.GetLatestTerm() ||
 		(lastTerm == r.logStore.GetLatestTerm() && lastIndex > r.logStore.GetLatestIndex()))
 }
@@ -360,7 +355,7 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 	}
 
 	wg := &sync.WaitGroup{}
-	wg.Add(2)
+	wg.Add(len(r.clients))
 	counter := NewAtomicCounter()
 
 	r.applyLock.Lock()
@@ -393,8 +388,8 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 	}
 
 	wg.Wait()
-	if uint64(counter.IdCount()) <= r.clientHalf-1 {
-		fmt.Println("failed to confirm log, count is:", counter.IdCount())
+	if uint64(counter.IdCount()) < r.clientHalf-1 {
+		fmt.Println("failed to confirm log, count is:", counter.IdCount(), r.clientHalf-1)
 		return 0, fmt.Errorf("failed to confirm log")
 	}
 
@@ -545,6 +540,7 @@ func (r *raft) startPipingStream(client *raftClient, startIndex, endIndex uint64
 		log, err := r.logStore.GetLog(current)
 		if err != nil {
 			fmt.Println("cannot find log:", current, err)
+			client.pipestream.CloseSend()
 			return err
 		}
 
@@ -559,9 +555,9 @@ func (r *raft) startPipingStream(client *raftClient, startIndex, endIndex uint64
 			return err
 		}
 
-		fmt.Println("piped:", current)
 		current++
 	}
 
+	client.pipestream.CloseSend()
 	return nil
 }

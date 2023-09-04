@@ -47,6 +47,7 @@ type LogStore interface {
 	RestoreLogs(ApplicationApply) error
 	IsPiping() bool
 	SetPiping(bool)
+	ApplyFrom(uint64, ApplicationApply)
 }
 
 type logStore struct {
@@ -72,7 +73,7 @@ func NewLogStore() (LogStore, error) {
 			make(map[uint64]*Log),
 			sync.RWMutex{},
 		},
-		index:      0,
+		index:      1,
 		term:       0,
 		threshold:  2000,
 		persistMux: &sync.Mutex{},
@@ -429,6 +430,19 @@ func (l *logStore) extractApplyLog(app ApplicationApply, data *[]byte) error {
 	}
 
 	return nil
+}
+
+func (l *logStore) ApplyFrom(index uint64, app ApplicationApply) {
+	for {
+		log, ok := l.logs.Get(index)
+		if !ok {
+			return
+		}
+
+		// we ignore error as maybe intentional
+		app.Apply(*log)
+		index++
+	}
 }
 
 func (l *logStore) IncrementIndex() {
