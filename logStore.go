@@ -36,7 +36,7 @@ type Log struct {
 }
 
 type LogStore interface {
-	AppendLog(Log) error
+	AppendLog(*Log) error
 	GetLog(uint64) (*Log, error)
 	SetLog(uint64, *Log) error
 	UpdateCommited(uint64) (bool, error)
@@ -81,12 +81,12 @@ func NewLogStore() (LogStore, error) {
 	}, nil
 }
 
-func (l *logStore) AppendLog(log Log) error {
+func (l *logStore) AppendLog(log *Log) error {
 	if l.logs == nil {
 		return fmt.Errorf("missing slice")
 	}
 
-	l.logs.Set(log.Index, &log)
+	l.logs.Set(log.Index, log)
 
 	go l.persistLog()
 	return nil
@@ -436,11 +436,16 @@ func (l *logStore) ApplyFrom(index uint64, app ApplicationApply) {
 	for {
 		log, ok := l.logs.Get(index)
 		if !ok {
+			l.index = index - 1
+			l.piping = false
 			return
 		}
 
 		// we ignore error as maybe intentional
-		app.Apply(*log)
+		if log.LeaderCommited {
+			app.Apply(*log)
+		}
+
 		index++
 	}
 }

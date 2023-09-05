@@ -66,7 +66,7 @@ func (r *raftServer) AppendEntries(ctx context.Context, req *AppendEntriesReques
 		return &AppendEntriesResult{Applied: false}, nil
 	}
 
-	if err := r.logStore.AppendLog(Log{
+	if err := r.logStore.AppendLog(&Log{
 		Term:    req.Term,
 		Index:   req.Index,
 		LogType: req.Type,
@@ -151,7 +151,7 @@ func (r *raftServer) AppendEntriesStream(stream AppendEntriesStreamServer) error
 			return err
 		}
 
-		err = r.logStore.AppendLog(Log{
+		err = r.logStore.AppendLog(&Log{
 			Term:    in.Term,
 			Index:   in.Index,
 			LogType: in.Type,
@@ -201,8 +201,6 @@ func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
 			}()
 
 		}
-
-		fmt.Println("piping")
 	}
 }
 

@@ -305,18 +305,20 @@ func (r *raft) hasRecievedHeartbeat() bool {
 }
 
 func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
-	latestIndex, err := r.broadCastAppendLog(data, typ)
+	log, err := r.broadCastAppendLog(data, typ)
 	if err != nil {
 		return nil, err
 	}
 
+	// TODO: fix this messy code up
 	defer r.commitLock.Unlock()
+
 	if typ == RAFT_LOG {
 		return nil, nil
 	}
 
 	var wg sync.WaitGroup
-	r.reqCommit.Index = latestIndex
+	r.reqCommit.Index = log.Index
 
 	ctx := context.Background()
 
@@ -326,11 +328,7 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	}
 
 	// apply log
-	data, err = r.appApply.Apply(Log{
-		Index:   latestIndex,
-		Data:    data,
-		LogType: typ,
-	})
+	data, err = r.appApply.Apply(*log)
 
 	if err != nil {
 		fmt.Println("failed to apply log:", err)
@@ -340,7 +338,7 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	return data, nil
 }
 
-func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
+func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	ctx := context.Background()
 
 	r.reqAppend.Term = r.logStore.GetLatestTerm()
@@ -382,21 +380,22 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (uint64, error) {
 		}, wg, counter)
 	}
 
-	if err := r.logStore.AppendLog(reqLog); err != nil {
+	if err := r.logStore.AppendLog(&reqLog); err != nil {
 		fmt.Println("leader append err:", err)
-		return 0, err
+		return nil, err
 	}
 
 	wg.Wait()
 	if uint64(counter.IdCount()) < r.clientHalf-1 {
 		fmt.Println("failed to confirm log, count is:", counter.IdCount(), r.clientHalf-1)
-		return 0, fmt.Errorf("failed to confirm log")
+		return nil, fmt.Errorf("failed to confirm log")
 	}
 
 	r.logStore.IncrementIndex()
+	reqLog.LeaderCommited = true
 	r.commitLock.Lock()
 
-	return latestIndex, nil
+	return &reqLog, nil
 
 }
 
