@@ -40,16 +40,12 @@ type raft struct {
 	// constants
 	clientHalf uint64
 
-	// heart beat
-	heartbeatTimer           *time.Timer
-	heartBeatTimeout         time.Duration
-	heartBeatTimeoutDuration time.Duration
-	heartBeatTime            time.Time
+	heartBeatTime time.Time
+	heartBeatChan chan time.Time
 
 	// channels
 	voteRequested chan *RequestVotesRequest
 	voteReceived  chan *SendVoteRequest
-	heartBeatChan chan time.Time
 
 	logStore LogStore
 
@@ -104,30 +100,25 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clients = append(clients, client)
 	}
 
-	heartBeatTimeout := time.Millisecond * 500
-
 	return &raft{
-		clients:                  clients,
-		grpc:                     grpcServer,
-		logStore:                 logStore,
-		heartbeatTimer:           time.NewTimer(heartBeatTimeout),
-		heartBeatTimeout:         heartBeatTimeout,
-		heartBeatTimeoutDuration: 2000 * time.Millisecond,
-		heartBeatTime:            time.Unix(0, 0),
-		heartBeatChan:            heartBeatChannel,
-		voteReceived:             votesReceivedChan,
-		voteRequested:            votesRequestedChan,
-		id:                       id,
-		leaderChan:               make(chan interface{}, 1),
-		appApply:                 appApply,
-		applyLock:                &sync.Mutex{},
-		commitLock:               &sync.Mutex{},
-		clientHalf:               uint64(len(clients))/2 + 1,
-		reqAppend:                &AppendEntriesRequest{},
-		reqCommit:                &CommitLogRequest{},
-		wgMap:                    make(map[uint64]*sync.WaitGroup),
-		indexCount:               make(map[uint64]*AtomicCounter),
-		electManager:             elect,
+		clients:       clients,
+		grpc:          grpcServer,
+		logStore:      logStore,
+		heartBeatTime: time.Unix(0, 0),
+		heartBeatChan: heartBeatChannel,
+		voteReceived:  votesReceivedChan,
+		voteRequested: votesRequestedChan,
+		id:            id,
+		leaderChan:    make(chan interface{}, 1),
+		appApply:      appApply,
+		applyLock:     &sync.Mutex{},
+		commitLock:    &sync.Mutex{},
+		clientHalf:    uint64(len(clients))/2 + 1,
+		reqAppend:     &AppendEntriesRequest{},
+		reqCommit:     &CommitLogRequest{},
+		wgMap:         make(map[uint64]*sync.WaitGroup),
+		indexCount:    make(map[uint64]*AtomicCounter),
+		electManager:  elect,
 	}
 }
 
@@ -190,7 +181,6 @@ func (r *raft) start() {
 			fmt.Println("results:", r.electManager.votes, r.clientHalf)
 
 			r.electManager.currentState = LEADER
-			go r.startHeartBeats()
 			fmt.Println("became leader")
 
 			r.buildStreams()
@@ -222,7 +212,7 @@ func (r *raft) start() {
 		case <-r.electManager.electionTimer.C:
 			// only begin election if no heartbeat has started
 			if r.hasRecievedHeartbeat() {
-				r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(rand.Intn(6000)))
+				r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(4000+rand.Intn(2000)))
 				continue
 			}
 
@@ -240,25 +230,6 @@ func (r *raft) start() {
 
 			r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(6000))
 		}
-	}
-}
-
-func (r *raft) startHeartBeats() {
-	hbReq := &HeartBeatRequest{}
-	ctx := context.Background()
-
-	for {
-		<-r.heartbeatTimer.C
-
-		for _, client := range r.clients {
-			ctxTime, cancel := context.WithTimeout(ctx, r.heartBeatTimeoutDuration)
-			if _, err := client.gClient.HeartBeat(ctxTime, hbReq); err != nil {
-				fmt.Println("Unable to find client:", client.address)
-			}
-			cancel()
-		}
-
-		r.heartbeatTimer.Reset(r.heartBeatTimeout)
 	}
 }
 
@@ -301,7 +272,7 @@ func (r *raft) getClientByID(id uint64) (*raftClient, error) {
 }
 
 func (r *raft) hasRecievedHeartbeat() bool {
-	return time.Since(r.heartBeatTime) < time.Second*2
+	return time.Since(r.heartBeatTime) < time.Second*4
 }
 
 func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
@@ -439,24 +410,44 @@ func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *C
 }
 
 func (r *raft) buildStreams() {
+	wg := &sync.WaitGroup{}
+	wg.Add(len(r.clients) * 2)
 	for _, client := range r.clients {
-		for i := 0; i < 3; i++ {
-			stream, err := client.gClient.AppendEntriesStream(context.Background())
-			if err != nil {
-				time.Sleep(2 * time.Second)
-				fmt.Println("cannot find client, err:", err)
-				continue
-			}
+		go func(client *raftClient, wg *sync.WaitGroup) {
+			defer wg.Done()
 
-			client.stream = stream
-		}
+			for i := 0; i < 3; i++ {
+				stream, err := client.gClient.AppendEntriesStream(context.Background())
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					fmt.Println("cannot find client, err:", err)
+					continue
+				}
+
+				client.stream = stream
+			}
+		}(client, wg)
+
+		go func(client *raftClient, wg *sync.WaitGroup) {
+			defer wg.Done()
+			for i := 0; i < 3; i++ {
+				stream, err := client.gClient.HeartBeatStream(context.Background())
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					fmt.Println("cannot find client, err:", err)
+					continue
+				}
+
+				client.heartBeatStream = stream
+			}
+		}(client, wg)
 	}
+	wg.Wait()
 }
 
 func (r *raft) startStream() {
 	for _, client := range r.clients {
 		go func(client *raftClient) {
-			defer fmt.Println("exited the loop")
 		START:
 			for {
 				if client.stream == nil {
@@ -503,6 +494,36 @@ func (r *raft) startStream() {
 				}
 
 				client.stream = stream
+				goto START
+
+			}
+		}(client)
+
+		go func(client *raftClient) {
+			defer fmt.Println("exited the loop")
+		START:
+			for {
+				if client.heartBeatStream == nil {
+					break
+				}
+
+				if err := client.heartBeatStream.Send(&HeartBeatRequest{}); err != nil {
+					fmt.Println("failed to send heart:", client.id)
+					break
+				}
+
+				client.heartbeatTimer.Reset(client.heartDur)
+				<-client.heartbeatTimer.C
+			}
+
+			for {
+				stream, err := client.gClient.HeartBeatStream(context.Background())
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					fmt.Println("cannot find client", client.id, " err:", err)
+				}
+
+				client.heartBeatStream = stream
 				goto START
 
 			}

@@ -6,15 +6,12 @@ package raft;
 
 // Interface exported by the server.
 service RaftService {
-   rpc GetStatus(StatusRequest) returns (StatusResult) {}
    rpc RequestVotes(RequestVotesRequest) returns (RequestVotesResult) {}
-   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResult) {} 
-   rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResult) {} 
    rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
    rpc CommitLog(CommitLogRequest) returns (CommitLogResult) {}
    rpc AppendEntriesStream(stream AppendEntriesRequest) returns (stream AppendEntriesResult) {}
    rpc PipeEntries(stream PipeEntriesRequest) returns (stream PipeEntriesResponse) {}
-   // rpc UncommitEntry(UncommitEntry) returns (UncommitEntryResult) {} 
+   rpc HeartBeatStream(stream HeartBeatRequest) returns (stream HeartBeatResult) {}
 }
 
 message StatusRequest {}
