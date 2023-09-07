@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc"
@@ -45,4 +47,36 @@ func newRaftClient(address string, id uint64) (*raftClient, error) {
 		heartDur:        heartDur,
 	}, nil
 
+}
+
+func (r *raftClient) buildAppendStream() error {
+	for i := 0; i < 3; i++ {
+		stream, err := r.gClient.AppendEntriesStream(context.Background())
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			fmt.Println("cannot find client, err:", err)
+			continue
+		}
+
+		r.stream = stream
+		return nil
+	}
+
+	return fmt.Errorf("failed to create append stream")
+}
+
+func (r *raftClient) buildHeartbeatStream() error {
+	for i := 0; i < 3; i++ {
+		stream, err := r.gClient.HeartBeatStream(context.Background())
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			fmt.Println("cannot find client, err:", err)
+			continue
+		}
+
+		r.heartBeatStream = stream
+		return nil
+	}
+
+	return fmt.Errorf("failed to create heartbeat stream")
 }

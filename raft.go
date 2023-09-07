@@ -64,8 +64,8 @@ type raft struct {
 	reqCommit *CommitLogRequest
 
 	// waitgroup/index counter
-	wgMap      map[uint64]*sync.WaitGroup
-	indexCount map[uint64]*AtomicCounter
+	wg    *sync.WaitGroup
+	index *AtomicCounter
 
 	// election
 	electManager *electionManager
@@ -116,8 +116,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clientHalf:    uint64(len(clients))/2 + 1,
 		reqAppend:     &AppendEntriesRequest{},
 		reqCommit:     &CommitLogRequest{},
-		wgMap:         make(map[uint64]*sync.WaitGroup),
-		indexCount:    make(map[uint64]*AtomicCounter),
+		wg:            nil,
+		index:         nil,
 		electManager:  elect,
 	}
 }
@@ -334,8 +334,8 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	r.reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
-	r.wgMap[latestIndex] = wg
-	r.indexCount[latestIndex] = counter
+	r.wg = wg
+	r.index = counter
 
 	for _, client := range r.clients {
 		if client.stream == nil {
@@ -412,36 +412,23 @@ func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *C
 func (r *raft) buildStreams() {
 	wg := &sync.WaitGroup{}
 	wg.Add(len(r.clients) * 2)
+
 	for _, client := range r.clients {
-		go func(client *raftClient, wg *sync.WaitGroup) {
+		go func(client *raftClient) {
 			defer wg.Done()
-
-			for i := 0; i < 3; i++ {
-				stream, err := client.gClient.AppendEntriesStream(context.Background())
-				if err != nil {
-					time.Sleep(2 * time.Second)
-					fmt.Println("cannot find client, err:", err)
-					continue
-				}
-
-				client.stream = stream
+			if err := client.buildAppendStream(); err != nil {
+				fmt.Println("err:", err)
 			}
-		}(client, wg)
+		}(client)
 
-		go func(client *raftClient, wg *sync.WaitGroup) {
+		go func(client *raftClient) {
 			defer wg.Done()
-			for i := 0; i < 3; i++ {
-				stream, err := client.gClient.HeartBeatStream(context.Background())
-				if err != nil {
-					time.Sleep(2 * time.Second)
-					fmt.Println("cannot find client, err:", err)
-					continue
-				}
-
-				client.heartBeatStream = stream
+			if err := client.buildHeartbeatStream(); err != nil {
+				fmt.Println("err:", err)
 			}
-		}(client, wg)
+		}(client)
 	}
+
 	wg.Wait()
 }
 
@@ -459,31 +446,19 @@ func (r *raft) startStream() {
 					break
 				}
 
-				counter, ok := r.indexCount[in.Index]
-				if !ok {
-					fmt.Println("not found counter")
-					continue
-				}
-
-				if counter.HasId(client.id) {
+				if r.index.HasId(client.id) {
 					fmt.Println("already has id")
-					continue
-				}
-
-				wg, ok := r.wgMap[in.Index]
-				if !ok {
-					fmt.Println("not found wg")
 					continue
 				}
 
 				if !in.Applied {
 					fmt.Println("not applied")
-					wg.Done()
+					r.wg.Done()
 					continue
 				}
 
-				counter.Increment(client.id)
-				wg.Done()
+				r.index.Increment(client.id)
+				r.wg.Done()
 			}
 
 			for {
