@@ -63,10 +63,6 @@ type raft struct {
 	reqAppend *AppendEntriesRequest
 	reqCommit *CommitLogRequest
 
-	// waitgroup/index counter
-	wg    *sync.WaitGroup
-	index *AtomicCounter
-
 	// election
 	electManager *electionManager
 }
@@ -116,8 +112,6 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clientHalf:    uint64(len(clients))/2 + 1,
 		reqAppend:     &AppendEntriesRequest{},
 		reqCommit:     &CommitLogRequest{},
-		wg:            nil,
-		index:         nil,
 		electManager:  elect,
 	}
 }
@@ -334,21 +328,13 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	r.reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
-	r.wg = wg
-	r.index = counter
-
 	for _, client := range r.clients {
 		if client.stream == nil {
 			wg.Done()
 			continue
 		}
 
-		go r.appendClient(ctx, client, &AppendEntriesRequest{
-			Index: latestIndex,
-			Term:  r.logStore.GetLatestTerm(),
-			Type:  DATA_LOG,
-			Data:  data,
-		}, wg, counter)
+		go client.append(ctx, r.reqAppend, wg, counter)
 	}
 
 	if err := r.logStore.AppendLog(&reqLog); err != nil {
@@ -357,8 +343,9 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	}
 
 	wg.Wait()
-	if uint64(counter.IdCount()) < r.clientHalf-1 {
-		fmt.Println("failed to confirm log, count is:", counter.IdCount(), r.clientHalf-1)
+	limit := r.clientHalf - 1
+	if uint64(counter.IdCount()) < limit {
+		fmt.Println("failed to confirm log, count is:", counter.IdCount(), limit)
 		return nil, fmt.Errorf("failed to confirm log")
 	}
 
@@ -370,38 +357,19 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 
 }
 
-func (r *raft) appendClient(ctx context.Context, client *raftClient, req *AppendEntriesRequest, wg *sync.WaitGroup, atom *AtomicCounter) {
-	if err := client.stream.Send(req); err != nil {
-		// fmt.Println("failed to send:", err)
-		wg.Done()
-		return
-	}
-
-	// timeout
-	go func() {
-		time.Sleep(3 * time.Second)
-		if atom.HasId(client.id) {
-			return
-		}
-
-		atom.AddIdOnly(client.id)
-		wg.Done()
-	}()
-}
-
 func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	result, err := client.gClient.CommitLog(ctx, commitReq)
 	if err != nil {
-		// fmt.Println("client append err:", err)
+		fmt.Println("client append err:", err)
 		return
 	}
 
 	if result.Missing != 0 && !client.piping {
 		// start piping logs
 		fmt.Println("needs to start piping now")
-		go r.startPipingStream(client, result.Missing, commitReq.Index)
+		go client.startPiping(r.logStore, result.Missing, commitReq.Index)
 	}
 
 	if !result.Applied {
@@ -434,125 +402,7 @@ func (r *raft) buildStreams() {
 
 func (r *raft) startStream() {
 	for _, client := range r.clients {
-		go func(client *raftClient) {
-		START:
-			for {
-				if client.stream == nil {
-					break
-				}
-
-				in, err := client.stream.Recv()
-				if err != nil {
-					break
-				}
-
-				if r.index.HasId(client.id) {
-					fmt.Println("already has id")
-					continue
-				}
-
-				if !in.Applied {
-					fmt.Println("not applied")
-					r.wg.Done()
-					continue
-				}
-
-				r.index.Increment(client.id)
-				r.wg.Done()
-			}
-
-			for {
-				stream, err := client.gClient.AppendEntriesStream(context.Background())
-				if err != nil {
-					time.Sleep(2 * time.Second)
-					fmt.Println("cannot find client, err:", err)
-				}
-
-				client.stream = stream
-				goto START
-
-			}
-		}(client)
-
-		go func(client *raftClient) {
-			defer fmt.Println("exited the loop")
-		START:
-			for {
-				if client.heartBeatStream == nil {
-					break
-				}
-
-				if err := client.heartBeatStream.Send(&HeartBeatRequest{}); err != nil {
-					fmt.Println("failed to send heart:", client.id)
-					break
-				}
-
-				client.heartbeatTimer.Reset(client.heartDur)
-				<-client.heartbeatTimer.C
-			}
-
-			for {
-				stream, err := client.gClient.HeartBeatStream(context.Background())
-				if err != nil {
-					time.Sleep(2 * time.Second)
-					fmt.Println("cannot find client", client.id, " err:", err)
-				}
-
-				client.heartBeatStream = stream
-				goto START
-
-			}
-		}(client)
-
+		go client.startApplyResultStream()
+		go client.startheartBeat()
 	}
-}
-
-func (r *raft) startPipingStream(client *raftClient, startIndex, endIndex uint64) error {
-	// reset once finished
-	defer func() {
-		client.pipestream = nil
-		client.piping = false
-	}()
-
-	current := startIndex
-
-	for i := 0; client.pipestream == nil && i < 3; i++ {
-		stream, err := client.gClient.PipeEntries(context.Background())
-		if err == nil {
-			client.pipestream = stream
-			break
-		}
-
-		if i == 2 {
-			return err
-		}
-
-		time.Sleep(time.Second)
-		fmt.Println("cannot find client, err:", err)
-	}
-
-	for current <= endIndex {
-		log, err := r.logStore.GetLog(current)
-		if err != nil {
-			fmt.Println("cannot find log:", current, err)
-			client.pipestream.CloseSend()
-			return err
-		}
-
-		if err := client.pipestream.Send(&PipeEntriesRequest{
-			Index:    current,
-			Data:     log.Data,
-			Commited: log.LeaderCommited,
-			Term:     log.Term,
-			Type:     log.LogType,
-		}); err != nil {
-			fmt.Println("err:", err)
-			return err
-		}
-
-		current++
-	}
-
-	client.pipestream.CloseSend()
-	return nil
 }
