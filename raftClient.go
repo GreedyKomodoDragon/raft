@@ -210,7 +210,6 @@ func (r *raftClient) append(ctx context.Context, req *AppendEntriesRequest, wg *
 	r.wg = wg
 
 	if err := r.stream.Send(req); err != nil {
-		// fmt.Println("failed to send:", err)
 		r.wg.Done()
 		return
 	}

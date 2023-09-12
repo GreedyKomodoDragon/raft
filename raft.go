@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -40,17 +39,10 @@ type raft struct {
 	// constants
 	clientHalf uint64
 
-	heartBeatTime time.Time
-	heartBeatChan chan time.Time
-
-	// channels
-	voteRequested chan *RequestVotesRequest
-	voteReceived  chan *SendVoteRequest
-
 	logStore LogStore
 
-	// leader channel
-	leaderChan chan interface{}
+	voteRequested chan *RequestVotesRequest
+	leaderChan    chan interface{}
 
 	// application apply
 	appApply ApplicationApply
@@ -74,16 +66,15 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	heartBeatChannel := make(chan time.Time, len(servers))
 	votesReceivedChan := make(chan *SendVoteRequest, len(servers))
 	votesRequestedChan := make(chan *RequestVotesRequest, len(servers))
+	leaderChan := make(chan interface{}, 1)
+	leaderChanInternal := make(chan interface{}, 1)
+	broadcastChan := make(chan interface{}, 1)
 
 	appApply := &StdOutApply{}
 
 	if err := logStore.RestoreLogs(appApply); err != nil {
 		fmt.Println("unable to read snapshots")
 	}
-
-	elect := newElectionManager(logStore)
-
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply, elect))
 
 	clients := []*raftClient{}
 	for _, server := range servers {
@@ -96,16 +87,16 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clients = append(clients, client)
 	}
 
+	elect := newElectionManager(logStore, votesRequestedChan, votesReceivedChan, heartBeatChannel,
+		uint64(len(clients))/2+1, leaderChan, leaderChanInternal, broadcastChan)
+
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply, elect))
+
 	return &raft{
 		clients:       clients,
 		grpc:          grpcServer,
 		logStore:      logStore,
-		heartBeatTime: time.Unix(0, 0),
-		heartBeatChan: heartBeatChannel,
-		voteReceived:  votesReceivedChan,
-		voteRequested: votesRequestedChan,
 		id:            id,
-		leaderChan:    make(chan interface{}, 1),
 		appApply:      appApply,
 		applyLock:     &sync.Mutex{},
 		commitLock:    &sync.Mutex{},
@@ -113,6 +104,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		reqAppend:     &AppendEntriesRequest{},
 		reqCommit:     &CommitLogRequest{},
 		electManager:  elect,
+		voteRequested: votesRequestedChan,
+		leaderChan:    leaderChan,
 	}
 }
 
@@ -121,109 +114,11 @@ func (r *raft) LeaderChan() chan interface{} {
 }
 
 func (r *raft) Start(lis net.Listener) {
+	go r.electManager.start()
 	go r.start()
 
 	if err := r.grpc.Serve(lis); err != nil {
 		panic(err) // unable to handle this
-	}
-}
-
-func (r *raft) start() {
-	for {
-		select {
-		case t := <-r.heartBeatChan:
-			r.heartBeatTime = t
-			r.electManager.foundLeader = true
-
-			if r.electManager.currentState == CANDIDATE {
-				fmt.Println("Demoted to follower as found leader")
-				r.electManager.currentState = FOLLOWER
-
-			}
-
-		case event := <-r.voteReceived:
-			if r.electManager.currentState == LEADER {
-				fmt.Println("already leader so ignored")
-				continue
-			}
-
-			// if found another leader
-			if r.hasRecievedHeartbeat() || r.electManager.currentState == FOLLOWER {
-				fmt.Println("Demoted to follower as found leader")
-				r.electManager.currentState = FOLLOWER
-				continue
-			}
-
-			if event.Voted {
-				fmt.Println("vote found:", event.Id)
-				r.electManager.votes++
-			}
-
-			r.electManager.clientedVoted++
-
-			if r.electManager.clientedVoted < r.clientHalf {
-				fmt.Println("not enough votes found")
-				continue
-			}
-
-			if r.electManager.votes < r.clientHalf {
-				fmt.Println("not enough votes in favour")
-				r.electManager.currentState = FOLLOWER
-				continue
-			}
-
-			fmt.Println("results:", r.electManager.votes, r.clientHalf)
-
-			r.electManager.currentState = LEADER
-			fmt.Println("became leader")
-
-			r.buildStreams()
-			r.startStream()
-
-			// send logs to followers and self
-			if _, err := r.ApplyLog([]byte{}, RAFT_LOG); err != nil {
-				fmt.Println("unable to append leader log", err)
-				continue
-			}
-
-			// run in goroutine to avoid stopping if ignored
-			go func() { r.leaderChan <- nil }()
-
-		case event := <-r.voteRequested:
-			client, err := r.getClientByID(event.Id)
-			if err != nil {
-				fmt.Println("couldn't find client who voted", event.Id)
-			}
-
-			fmt.Println("voted:", r.sendVote(event.Index, event.Term))
-			if _, err := client.gClient.SendVote(context.Background(), &SendVoteRequest{
-				Voted: r.sendVote(event.Index, event.Term),
-				Id:    r.id,
-			}); err != nil {
-				fmt.Println("unable to send vote to node, err=", err)
-			}
-
-		case <-r.electManager.electionTimer.C:
-			// only begin election if no heartbeat has started
-			if r.hasRecievedHeartbeat() {
-				r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(4000+rand.Intn(2000)))
-				continue
-			}
-
-			if r.electManager.currentState == LEADER {
-				continue
-			}
-
-			r.electManager.foundLeader = false
-			r.logStore.IncrementTerm()
-			r.electManager.currentState = CANDIDATE
-
-			fmt.Println("Starting/reseting election!")
-			r.electManager.resetVotes()
-			r.broadCastVotes()
-
-			r.electManager.electionTimer.Reset(time.Millisecond * time.Duration(6000))
-		}
 	}
 }
 
@@ -242,31 +137,39 @@ func (r *raft) broadCastVotes() {
 	}
 }
 
-func (r *raft) sendVote(lastIndex uint64, lastTerm uint64) bool {
-	// if recieved heartbeat already has a leader
-	// if grant vote only if the candidate has higher term
-	// otherwise the last log entry has the same term, grant vote if candidate has a longer log
-	// why have !r.electManager.foundLeader? it allows a much easier comparsion to occur
-	return !r.electManager.foundLeader && r.electManager.currentState != LEADER && (lastTerm > r.logStore.GetLatestTerm() ||
-		(lastTerm == r.logStore.GetLatestTerm() && lastIndex > r.logStore.GetLatestIndex()))
-}
+func (r *raft) start() {
+	for {
+		select {
+		case <-r.electManager.leaderChanInternal:
+			r.buildStreams()
+			r.startStream()
 
-func (r *raft) getClientByID(id uint64) (*raftClient, error) {
-	if len(r.clients) == 0 {
-		return nil, fmt.Errorf("no clients")
-	}
+			// send logs to followers and self
+			if _, err := r.ApplyLog([]byte{}, RAFT_LOG); err != nil {
+				fmt.Println("unable to append leader log", err)
+			}
 
-	for _, client := range r.clients {
-		if client.id == id {
-			return client, nil
+			// now streams are established
+			go func() { r.leaderChan <- nil }()
+
+		case <-r.electManager.broadcastChan:
+			r.broadCastVotes()
+
+		case event := <-r.voteRequested:
+			client, err := r.getClientByID(event.Id)
+			if err != nil {
+				fmt.Println("couldn't find client who voted", event.Id)
+			}
+
+			if _, err := client.gClient.SendVote(context.Background(), &SendVoteRequest{
+				Voted: r.electManager.sendVote(event.Index, event.Term),
+				Id:    r.id,
+			}); err != nil {
+				fmt.Println("unable to send vote to node, err=", err)
+			}
 		}
 	}
 
-	return nil, fmt.Errorf("cannot find client")
-}
-
-func (r *raft) hasRecievedHeartbeat() bool {
-	return time.Since(r.heartBeatTime) < time.Second*4
 }
 
 func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
@@ -294,7 +197,6 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 
 	// apply log
 	data, err = r.appApply.Apply(*log)
-
 	if err != nil {
 		fmt.Println("failed to apply log:", err)
 	}
@@ -345,7 +247,7 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	wg.Wait()
 	limit := r.clientHalf - 1
 	if uint64(counter.IdCount()) < limit {
-		fmt.Println("failed to confirm log, count is:", counter.IdCount(), limit)
+		fmt.Println("failed to append log, count is:", counter.IdCount(), limit, latestIndex)
 		return nil, fmt.Errorf("failed to confirm log")
 	}
 
@@ -405,4 +307,18 @@ func (r *raft) startStream() {
 		go client.startApplyResultStream()
 		go client.startheartBeat()
 	}
+}
+
+func (r *raft) getClientByID(id uint64) (*raftClient, error) {
+	if len(r.clients) == 0 {
+		return nil, fmt.Errorf("no clients")
+	}
+
+	for _, client := range r.clients {
+		if client.id == id {
+			return client, nil
+		}
+	}
+
+	return nil, fmt.Errorf("cannot find client")
 }
