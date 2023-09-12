@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 )
 
@@ -60,6 +61,7 @@ type raft struct {
 }
 
 func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
+
 	var opts []grpc.ServerOption
 	grpcServer := grpc.NewServer(opts...)
 
@@ -73,14 +75,14 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	appApply := &StdOutApply{}
 
 	if err := logStore.RestoreLogs(appApply); err != nil {
-		fmt.Println("unable to read snapshots")
+		log.Info().Msg("Unable to read in snapshots successfully")
 	}
 
 	clients := []*raftClient{}
 	for _, server := range servers {
 		client, err := newRaftClient(server.Address, server.Id)
 		if err != nil {
-			fmt.Println("cannot make client, err=", err)
+			log.Error().Err(err).Msg("Unable to create client")
 			continue
 		}
 
@@ -132,7 +134,7 @@ func (r *raft) broadCastVotes() {
 
 	for _, client := range r.clients {
 		if _, err := client.gClient.RequestVotes(ctx, req); err != nil {
-			fmt.Println("Unable to find client:", client.address)
+			log.Error().Err(err).Str("address", client.address).Msg("Unable to find client")
 		}
 	}
 }
@@ -146,7 +148,7 @@ func (r *raft) start() {
 
 			// send logs to followers and self
 			if _, err := r.ApplyLog([]byte{}, RAFT_LOG); err != nil {
-				fmt.Println("unable to append leader log", err)
+				log.Error().Err(err).Msg("unable to send leader log")
 			}
 
 			// now streams are established
@@ -158,14 +160,14 @@ func (r *raft) start() {
 		case event := <-r.voteRequested:
 			client, err := r.getClientByID(event.Id)
 			if err != nil {
-				fmt.Println("couldn't find client who voted", event.Id)
+				log.Error().Err(err).Uint64("clientId", event.Id).Msg("couldn't find client who voted")
 			}
 
 			if _, err := client.gClient.SendVote(context.Background(), &SendVoteRequest{
 				Voted: r.electManager.sendVote(event.Index, event.Term),
 				Id:    r.id,
 			}); err != nil {
-				fmt.Println("unable to send vote to node, err=", err)
+				log.Error().Err(err).Uint64("clientId", event.Id).Msg("unable to send vote to node")
 			}
 		}
 	}
@@ -173,7 +175,7 @@ func (r *raft) start() {
 }
 
 func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
-	log, err := r.broadCastAppendLog(data, typ)
+	lg, err := r.broadCastAppendLog(data, typ)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +188,7 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	}
 
 	var wg sync.WaitGroup
-	r.reqCommit.Index = log.Index
+	r.reqCommit.Index = lg.Index
 
 	ctx := context.Background()
 
@@ -196,9 +198,9 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	}
 
 	// apply log
-	data, err = r.appApply.Apply(*log)
+	data, err = r.appApply.Apply(*lg)
 	if err != nil {
-		fmt.Println("failed to apply log:", err)
+		log.Error().Err(err).Msg("failed to apply log")
 	}
 
 	wg.Wait()
@@ -240,14 +242,14 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	}
 
 	if err := r.logStore.AppendLog(&reqLog); err != nil {
-		fmt.Println("leader append err:", err)
+		log.Error().Err(err).Msg("failed to append as leader")
 		return nil, err
 	}
 
 	wg.Wait()
 	limit := r.clientHalf - 1
 	if uint64(counter.IdCount()) < limit {
-		fmt.Println("failed to append log, count is:", counter.IdCount(), limit, latestIndex)
+		log.Error().Int("counter", counter.IdCount()).Uint64("limit", limit).Msg("failed to confirm log")
 		return nil, fmt.Errorf("failed to confirm log")
 	}
 
@@ -264,18 +266,18 @@ func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *C
 
 	result, err := client.gClient.CommitLog(ctx, commitReq)
 	if err != nil {
-		fmt.Println("client append err:", err)
+		log.Error().Err(err).Msg("client failed to append")
 		return
 	}
 
 	if result.Missing != 0 && !client.piping {
 		// start piping logs
-		fmt.Println("needs to start piping now")
+		log.Info().Uint64("clientId", client.id).Msg("start piping to client")
 		go client.startPiping(r.logStore, result.Missing, commitReq.Index)
 	}
 
 	if !result.Applied {
-		fmt.Println("client failed to commit:", commitReq.Index, client.id)
+		log.Error().Uint64("clientId", client.id).Uint64("index", commitReq.Index).Msg("client failed to commit")
 	}
 }
 
@@ -287,14 +289,14 @@ func (r *raft) buildStreams() {
 		go func(client *raftClient) {
 			defer wg.Done()
 			if err := client.buildAppendStream(); err != nil {
-				fmt.Println("err:", err)
+				log.Error().Err(err).Msg("unable to build append stream")
 			}
 		}(client)
 
 		go func(client *raftClient) {
 			defer wg.Done()
 			if err := client.buildHeartbeatStream(); err != nil {
-				fmt.Println("err:", err)
+				log.Error().Err(err).Msg("unable to build heartbeat stream")
 			}
 		}(client)
 	}

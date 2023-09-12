@@ -1,9 +1,10 @@
 package raft
 
 import (
-	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 type electionManager struct {
@@ -57,44 +58,43 @@ func (e *electionManager) start() {
 			e.foundLeader = true
 
 			if e.currentState == CANDIDATE {
-				fmt.Println("Demoted to follower as found leader")
+				log.Info().Str("currentState", "CANDIDATE").Msg("demoted to follower as found leader")
 				e.currentState = FOLLOWER
 
 			}
 
 		case event := <-e.voteReceived:
 			if e.currentState == LEADER {
-				fmt.Println("already leader so ignored")
+				log.Info().Msg("already leader so ignored")
 				continue
 			}
 
 			// if found another leader
 			if e.hasRecievedHeartbeat() || e.currentState == FOLLOWER {
-				fmt.Println("Demoted to follower as found leader")
+				log.Info().Str("currentState", "CANDIDATE").Msg("demoted to follower as found leader")
 				e.currentState = FOLLOWER
 				continue
 			}
 
 			if event.Voted {
-				fmt.Println("vote found:", event.Id)
+				log.Debug().Uint64("nodeId", event.Id).Msg("vote found")
 				e.votes++
 			}
 
 			e.clientedVoted++
 			if e.clientedVoted < e.clientHalf {
-				fmt.Println("not enough votes found")
+				log.Debug().Msg("not enough votes found")
 				continue
 			}
 
 			if e.votes < e.clientHalf {
-				fmt.Println("not enough votes in favour")
+				log.Info().Msg("not enough votes in favour, demoted to follower")
 				e.currentState = FOLLOWER
 				continue
 			}
 
 			e.currentState = LEADER
-			fmt.Println("became leader")
-
+			log.Info().Msg("became leader")
 			e.leaderChanInternal <- nil
 
 		case <-e.electionTimer.C:
@@ -111,8 +111,7 @@ func (e *electionManager) start() {
 			e.foundLeader = false
 			e.logStore.IncrementTerm()
 			e.currentState = CANDIDATE
-
-			fmt.Println("Starting/reseting election!")
+			log.Info().Msg("starting election")
 			e.resetVotes()
 
 			e.electionTimer.Reset(time.Millisecond * time.Duration(6000))

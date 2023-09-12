@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -54,7 +55,6 @@ func (r *raftClient) buildAppendStream() error {
 		stream, err := r.gClient.AppendEntriesStream(context.Background())
 		if err != nil {
 			time.Sleep(2 * time.Second)
-			fmt.Println("cannot find client, err:", err)
 			continue
 		}
 
@@ -70,7 +70,6 @@ func (r *raftClient) buildHeartbeatStream() error {
 		stream, err := r.gClient.HeartBeatStream(context.Background())
 		if err != nil {
 			time.Sleep(2 * time.Second)
-			fmt.Println("cannot find client, err:", err)
 			continue
 		}
 
@@ -102,25 +101,24 @@ func (r *raftClient) startPiping(logStore LogStore, startIndex, endIndex uint64)
 		}
 
 		time.Sleep(time.Second)
-		fmt.Println("cannot find client, err:", err)
 	}
 
 	for current <= endIndex {
-		log, err := logStore.GetLog(current)
+		lg, err := logStore.GetLog(current)
 		if err != nil {
-			fmt.Println("cannot find log:", current, err)
+			log.Error().Uint64("index", current).Err(err).Msg("cannot find log in pipe")
 			r.pipestream.CloseSend()
 			return err
 		}
 
 		if err := r.pipestream.Send(&PipeEntriesRequest{
 			Index:    current,
-			Data:     log.Data,
-			Commited: log.LeaderCommited,
-			Term:     log.Term,
-			Type:     log.LogType,
+			Data:     lg.Data,
+			Commited: lg.LeaderCommited,
+			Term:     lg.Term,
+			Type:     lg.LogType,
 		}); err != nil {
-			fmt.Println("err:", err)
+			log.Error().Uint64("index", current).Err(err).Msg("failed to send")
 			return err
 		}
 
@@ -140,22 +138,24 @@ func (r *raftClient) startheartBeat() {
 			}
 
 			if err := r.heartBeatStream.Send(hb); err != nil {
-				fmt.Println("failed to send heart:", r.id)
+				log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send heart")
 				break
 			}
 
-			r.heartbeatTimer.Reset(r.heartDur)
-			<-r.heartbeatTimer.C
+			// r.heartbeatTimer.Reset(r.heartDur)
+			time.Sleep(r.heartDur)
 		}
 
 		for {
 			stream, err := r.gClient.HeartBeatStream(context.Background())
 			if err != nil {
-				time.Sleep(2 * time.Second)
-				fmt.Println("cannot find client", r.id, " err:", err)
+				log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to find client in heartbeat stream")
+				time.Sleep(r.heartDur)
+				continue
 			}
 
 			r.heartBeatStream = stream
+			break
 		}
 	}
 }
@@ -173,12 +173,12 @@ func (r *raftClient) startApplyResultStream() {
 			}
 
 			if r.atom.HasId(r.id) {
-				fmt.Println("already has id")
+				log.Debug().Uint64("clientId", r.id).Err(err).Msg("already has id in result stream")
 				continue
 			}
 
 			if !in.Applied {
-				fmt.Println("not applied")
+				log.Debug().Uint64("clientId", r.id).Err(err).Msg("not applied in result stream")
 				r.wg.Done()
 				continue
 			}
@@ -197,11 +197,13 @@ func (r *raftClient) recreateAppendStream() {
 	for {
 		stream, err := r.gClient.AppendEntriesStream(context.Background())
 		if err != nil {
+			log.Error().Uint64("clientId", r.id).Err(err).Msg("cannot find client for append stream")
 			time.Sleep(2 * time.Second)
-			fmt.Println("cannot find client, err:", err)
+			continue
 		}
 
 		r.stream = stream
+		break
 	}
 }
 
@@ -210,6 +212,7 @@ func (r *raftClient) append(ctx context.Context, req *AppendEntriesRequest, wg *
 	r.wg = wg
 
 	if err := r.stream.Send(req); err != nil {
+		log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
 		r.wg.Done()
 		return
 	}

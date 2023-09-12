@@ -2,10 +2,10 @@ package raft
 
 import (
 	context "context"
-	"fmt"
 	"io"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -63,20 +63,20 @@ func (r *raftServer) SendVote(ctx context.Context, req *SendVoteRequest) (*SendV
 
 func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*CommitLogResult, error) {
 	if !r.electManager.foundLeader {
-		fmt.Println("leader not found yet")
+		log.Error().Msg("leader not found yet")
 		return &CommitLogResult{
 			Applied: false,
 		}, nil
 	}
 
-	log, err := r.logStore.GetLog(req.Index)
+	lg, err := r.logStore.GetLog(req.Index)
 	if err != nil {
 		return &CommitLogResult{
 			Applied: false,
 		}, err
 	}
 
-	log.LeaderCommited = true
+	lg.LeaderCommited = true
 
 	// return early if piping
 	if r.logStore.IsPiping() {
@@ -86,8 +86,8 @@ func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*Com
 	}
 
 	// request the pipeling to begin
-	if log.Index-1 > r.logStore.GetLatestIndex() {
-		fmt.Println("request piping")
+	if lg.Index-1 > r.logStore.GetLatestIndex() {
+		log.Info().Msg("requesting piping")
 		r.logStore.SetPiping(true)
 
 		return &CommitLogResult{
@@ -99,7 +99,7 @@ func (r *raftServer) CommitLog(ctx context.Context, req *CommitLogRequest) (*Com
 	if _, err = r.appApply.Apply(Log{
 		Index:   req.Index,
 		LogType: DATA_LOG,
-		Data:    log.Data,
+		Data:    lg.Data,
 	}); err != nil {
 		return &CommitLogResult{
 			Applied: false,
@@ -145,12 +145,12 @@ func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
 	for {
 		in, err := stream.Recv()
 		if err == io.EOF {
-			fmt.Println("finished piping")
+			log.Info().Msg("finished piping")
 			return nil
 		}
 
 		if err != nil {
-			fmt.Println("piping err stream:", err)
+			log.Err(err).Msg("issue while piping logs")
 			return err
 		}
 
@@ -161,14 +161,13 @@ func (r *raftServer) PipeEntries(stream PipeEntriesServer) error {
 			LogType:        in.Type,
 			LeaderCommited: in.Commited,
 		}); err != nil {
-			fmt.Println("piping err set:", err)
-			return fmt.Errorf("failed to set log")
+			log.Err(err).Msg("issue when setting log")
+			return err
 		}
 
 		if first == 0 {
 			first = in.Index
 			defer func() {
-				fmt.Println("applying from:", first)
 				go r.logStore.ApplyFrom(first, r.appApply)
 			}()
 
@@ -184,7 +183,7 @@ func (r *raftServer) HeartBeatStream(stream HeartBeatStreamServer) error {
 		}
 
 		if err != nil {
-			fmt.Println("heartbeat err stream:", err)
+			log.Err(err).Msg("issue while receiving heartbeat")
 			return err
 		}
 

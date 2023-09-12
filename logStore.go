@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/rs/zerolog/log"
 	"github.com/vmihailenco/msgpack"
 )
 
@@ -220,17 +221,17 @@ func (l *logStore) UpdateCommited(index uint64) (bool, error) {
 		return false, fmt.Errorf("missing slice")
 	}
 
-	log, ok := l.logs.Get(index)
+	lg, ok := l.logs.Get(index)
 	if !ok {
 		return false, fmt.Errorf("cannot find log: %v", index)
 	}
 
-	log.LeaderCommited = true
+	lg.LeaderCommited = true
 
 	// TODO: breaks seperation/AppendLog side effect introduced so fix!
 	// Also very brittle
-	if log.Index-1 != l.index && !l.piping {
-		fmt.Println("missing log!", log.Index, l.index)
+	if lg.Index-1 != l.index && !l.piping {
+		log.Info().Msg("missing a log, piping required")
 		l.piping = true
 		return true, nil
 	}
@@ -256,20 +257,20 @@ func (l *logStore) persistLog() error {
 
 	entries, err := os.ReadDir(LOG_DIR)
 	if err != nil {
-		fmt.Println("unable to read:", err)
+		log.Error().Err(err).Msg("unable to read snapshot file")
 		return err
 	}
 
 	for _, entry := range entries {
 		splitEntry := strings.Split(entry.Name(), HYPEN)
 		if len(splitEntry) < 2 {
-			fmt.Println("failed to split")
+			log.Error().Str("filename", entry.Name()).Msg("failed to split file")
 			return fmt.Errorf("unable to split")
 		}
 
 		i, err := strconv.ParseUint(splitEntry[1], 10, 64)
 		if err != nil {
-			fmt.Println("failed to parse")
+			log.Error().Str("filename", splitEntry[1]).Err(err).Msg("failed to parse uint64")
 			return err
 		}
 
@@ -300,29 +301,31 @@ func (l *logStore) persistLog() error {
 			break
 		}
 
-		f, err := os.Create(fmt.Sprintf(FILE_FORMAT, lower, upper))
+		fileLocation := fmt.Sprintf(FILE_FORMAT, lower, upper)
+		f, err := os.Create(fileLocation)
 		if err != nil {
-			fmt.Println("failed to create file")
+			log.Error().Str("fileLocation", fileLocation).Err(err).Msg("failed to create file")
 			return nil
 		}
+
 		defer f.Close()
 
 		for i := lower; i <= upper; i++ {
-			log, err := l.GetLog(i)
+			lg, err := l.GetLog(i)
 			if err != nil {
-				fmt.Println("failed to get log when persisting:", err)
+				log.Error().Uint64("index", i).Err(err).Msg("failed to get log when persisting")
 				return err
 			}
 
-			logData, err := msgpack.Marshal(log)
+			logData, err := msgpack.Marshal(lg)
 			if err != nil {
-				fmt.Println("failed to marshall")
+				log.Error().Bytes("data", logData).Uint64("index", i).Err(err).Msg("failed to marshall")
 				return err
 			}
 
 			logData = append(logData, BREAK_SYMBOL...)
 			if _, err := f.Write(logData); err != nil {
-				fmt.Println("failed to write")
+				log.Error().Bytes("data", logData).Uint64("index", i).Err(err).Msg("failed to write log data to disk")
 				return err
 			}
 		}
@@ -337,7 +340,7 @@ func (l *logStore) persistLog() error {
 func (l *logStore) RestoreLogs(app ApplicationApply) error {
 	dir, err := os.ReadDir(LOG_DIR)
 	if err != nil {
-		fmt.Println("Error:", err)
+		log.Error().Err(err).Msg("unable to read directory when restoring logs")
 		return err
 	}
 
@@ -354,14 +357,16 @@ func (l *logStore) RestoreLogs(app ApplicationApply) error {
 			continue
 		}
 
-		file, err := os.Open(LOG_DIR + "/" + entry.Name())
+		location := LOG_DIR + "/" + entry.Name()
+		file, err := os.Open(location)
 		if err != nil {
-			fmt.Println("Error:", err)
+			log.Error().Str("location", location).Err(err).Msg("unable to open file")
 			continue
 		}
 		defer file.Close()
 
 		if err := l.restore(app, io.ReadCloser(file)); err != nil {
+			log.Error().Str("location", location).Err(err).Msg("unable to restore from file")
 			return err
 		}
 	}
@@ -411,22 +416,22 @@ func (l *logStore) restore(app ApplicationApply, rClose io.ReadCloser) error {
 }
 
 func (l *logStore) extractApplyLog(app ApplicationApply, data *[]byte) error {
-	log := Log{}
-	if err := msgpack.Unmarshal(*data, &log); err != nil {
+	lg := Log{}
+	if err := msgpack.Unmarshal(*data, &lg); err != nil {
 		return err
 	}
 
 	// update to latest term and index found in snapshot
-	if log.Term > l.term {
-		l.term = log.Term
+	if lg.Term > l.term {
+		l.term = lg.Term
 	}
 
-	if log.Index > l.index {
-		l.index = log.Index
+	if lg.Index > l.index {
+		l.index = lg.Index
 	}
 
-	if _, err := app.Apply(log); err != nil {
-		fmt.Println("log failed on application")
+	if _, err := app.Apply(lg); err != nil {
+		log.Error().Uint64("log", lg.Index).Err(err).Msg("unable to apply log")
 	}
 
 	return nil
