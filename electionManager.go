@@ -15,33 +15,35 @@ type electionManager struct {
 	electionTimer *time.Timer
 	logStore      LogStore
 
-	voteReceived  chan *SendVoteRequest
-	heartBeatTime time.Time
-	heartBeatChan chan time.Time
+	voteReceived        chan *SendVoteRequest
+	heartBeatTime       time.Time
+	heartBeatTimeDouble time.Duration
+	heartBeatChan       chan time.Time
 
 	leaderChanInternal chan interface{}
 	broadcastChan      chan interface{}
 
 	clientHalf uint64
+	conf       *ElectionConfig
 }
 
-func newElectionManager(logStore LogStore, voteRequested chan *RequestVotesRequest, voteReceived chan *SendVoteRequest,
-	heartBeatChan chan time.Time, clientHalf uint64, leaderChan chan interface{}, leaderChanInternal chan interface{},
-	broadcastChan chan interface{}) *electionManager {
+func newElectionManager(logStore LogStore, clientCount int, conf *ElectionConfig) *electionManager {
 
 	return &electionManager{
-		currentState:       FOLLOWER,
-		votes:              0,
-		clientedVoted:      0,
-		logStore:           logStore,
-		electionTimer:      time.NewTimer(time.Millisecond * time.Duration(3000+rand.Intn(6000))),
-		foundLeader:        false,
-		clientHalf:         clientHalf,
-		heartBeatTime:      time.Unix(0, 0),
-		voteReceived:       voteReceived,
-		heartBeatChan:      heartBeatChan,
-		leaderChanInternal: leaderChanInternal,
-		broadcastChan:      broadcastChan,
+		currentState:        FOLLOWER,
+		votes:               0,
+		clientedVoted:       0,
+		logStore:            logStore,
+		electionTimer:       time.NewTimer(time.Millisecond * time.Duration(3000+rand.Intn(6000))),
+		foundLeader:         false,
+		clientHalf:          uint64(clientCount/2 + 1),
+		heartBeatTime:       time.Unix(0, 0),
+		voteReceived:        make(chan *SendVoteRequest, clientCount),
+		heartBeatChan:       make(chan time.Time, clientCount),
+		leaderChanInternal:  make(chan interface{}, 1),
+		broadcastChan:       make(chan interface{}, 1),
+		heartBeatTimeDouble: conf.HeartbeatTimeout * 2,
+		conf:                conf,
 	}
 }
 
@@ -100,7 +102,7 @@ func (e *electionManager) start() {
 		case <-e.electionTimer.C:
 			// only begin election if no heartbeat has started
 			if e.hasRecievedHeartbeat() {
-				e.electionTimer.Reset(time.Millisecond * time.Duration(4000+rand.Intn(2000)))
+				e.electionTimer.Reset(e.conf.ElectionTimeout)
 				continue
 			}
 
@@ -114,7 +116,7 @@ func (e *electionManager) start() {
 			log.Info().Msg("starting election")
 			e.resetVotes()
 
-			e.electionTimer.Reset(time.Millisecond * time.Duration(6000))
+			e.electionTimer.Reset(e.conf.ElectionTimeout)
 
 			// channel
 			e.broadcastChan <- nil
@@ -123,7 +125,7 @@ func (e *electionManager) start() {
 }
 
 func (e *electionManager) hasRecievedHeartbeat() bool {
-	return time.Since(e.heartBeatTime) < time.Second*4
+	return time.Since(e.heartBeatTime) < e.heartBeatTimeDouble
 }
 
 func (e *electionManager) sendVote(lastIndex uint64, lastTerm uint64) bool {

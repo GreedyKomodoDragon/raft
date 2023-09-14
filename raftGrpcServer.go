@@ -22,29 +22,20 @@ type raftGrpcServer interface {
 }
 
 type raftServer struct {
-	logStore     LogStore
-	electManager *electionManager
-
-	// heartbeat
+	logStore      LogStore
+	electManager  *electionManager
 	hbResult      *HeartBeatResult
-	heartbeatChan chan time.Time
-
 	voteRequested chan *RequestVotesRequest
-	voteReceived  chan *SendVoteRequest
-
-	appApply ApplicationApply
+	appApply      ApplicationApply
 
 	UnimplementedRaftServiceServer
 }
 
-func newRaftGrpcServer(logStore LogStore, heartBeatChan chan time.Time, voteRequested chan *RequestVotesRequest,
-	voteReceived chan *SendVoteRequest, appApply ApplicationApply, electManager *electionManager) raftGrpcServer {
+func newRaftGrpcServer(logStore LogStore, voteRequested chan *RequestVotesRequest, appApply ApplicationApply, electManager *electionManager) raftGrpcServer {
 	return &raftServer{
 		logStore:      logStore,
-		heartbeatChan: heartBeatChan,
 		hbResult:      &HeartBeatResult{},
 		voteRequested: voteRequested,
-		voteReceived:  voteReceived,
 		appApply:      appApply,
 		electManager:  electManager,
 	}
@@ -56,7 +47,7 @@ func (r *raftServer) RequestVotes(ctx context.Context, req *RequestVotesRequest)
 }
 
 func (r *raftServer) SendVote(ctx context.Context, req *SendVoteRequest) (*SendVoteResult, error) {
-	r.voteReceived <- req
+	r.electManager.voteReceived <- req
 
 	return &SendVoteResult{}, nil
 }
@@ -187,7 +178,7 @@ func (r *raftServer) HeartBeatStream(stream HeartBeatStreamServer) error {
 			return err
 		}
 
-		r.heartbeatChan <- time.Now()
+		r.electManager.heartBeatChan <- time.Now()
 	}
 }
 

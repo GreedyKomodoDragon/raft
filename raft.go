@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -58,19 +57,14 @@ type raft struct {
 
 	// election
 	electManager *electionManager
+
+	// raft configurations
+	conf *RaftConfig
 }
 
-func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
-
-	var opts []grpc.ServerOption
-	grpcServer := grpc.NewServer(opts...)
-
-	heartBeatChannel := make(chan time.Time, len(servers))
-	votesReceivedChan := make(chan *SendVoteRequest, len(servers))
-	votesRequestedChan := make(chan *RequestVotesRequest, len(servers))
-	leaderChan := make(chan interface{}, 1)
-	leaderChanInternal := make(chan interface{}, 1)
-	broadcastChan := make(chan interface{}, 1)
+func NewRaftServer(logStore LogStore, conf *Configuration) Raft {
+	grpcServer := grpc.NewServer(conf.RaftConfig.ServerOpts...)
+	votesRequestedChan := make(chan *RequestVotesRequest, len(conf.RaftConfig.Servers))
 
 	appApply := &StdOutApply{}
 
@@ -79,8 +73,8 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 	}
 
 	clients := []*raftClient{}
-	for _, server := range servers {
-		client, err := newRaftClient(server.Address, server.Id)
+	for _, server := range conf.RaftConfig.Servers {
+		client, err := newRaftClient(server, conf.ElectionConfig.HeartbeatTimeout, conf.RaftConfig.ClientConf)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to create client")
 			continue
@@ -89,25 +83,24 @@ func NewRaftServer(servers []Server, logStore LogStore, id uint64) Raft {
 		clients = append(clients, client)
 	}
 
-	elect := newElectionManager(logStore, votesRequestedChan, votesReceivedChan, heartBeatChannel,
-		uint64(len(clients))/2+1, leaderChan, leaderChanInternal, broadcastChan)
-
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, heartBeatChannel, votesRequestedChan, votesReceivedChan, appApply, elect))
+	elect := newElectionManager(logStore, len(conf.RaftConfig.Servers), conf.ElectionConfig)
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, appApply, elect))
 
 	return &raft{
 		clients:       clients,
 		grpc:          grpcServer,
 		logStore:      logStore,
-		id:            id,
+		id:            conf.RaftConfig.Id,
 		appApply:      appApply,
 		applyLock:     &sync.Mutex{},
 		commitLock:    &sync.Mutex{},
-		clientHalf:    uint64(len(clients))/2 + 1,
+		clientHalf:    uint64(len(clients)/2 + 1),
 		reqAppend:     &AppendEntriesRequest{},
 		reqCommit:     &CommitLogRequest{},
 		electManager:  elect,
 		voteRequested: votesRequestedChan,
-		leaderChan:    leaderChan,
+		leaderChan:    make(chan interface{}, 1),
+		conf:          conf.RaftConfig,
 	}
 }
 
@@ -192,7 +185,7 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 
 	ctx := context.Background()
 
-	wg.Add(2)
+	wg.Add(len(r.clients))
 	for _, client := range r.clients {
 		go r.applyClient(ctx, client, r.reqCommit, &wg)
 	}
@@ -258,7 +251,6 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	r.commitLock.Lock()
 
 	return &reqLog, nil
-
 }
 
 func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {

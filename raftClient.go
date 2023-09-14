@@ -8,7 +8,6 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type raftClient struct {
@@ -20,41 +19,34 @@ type raftClient struct {
 	pipestream      pipeEntriesClient
 	heartBeatStream heartBeatStreamClient
 	piping          bool
-	heartbeatTimer  *time.Timer
 	heartDur        time.Duration
 	atom            *AtomicCounter
 	wg              *sync.WaitGroup
+	conf            *ClientConfig
 }
 
-func newRaftClient(address string, id uint64) (*raftClient, error) {
-	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-
-	conn, err := grpc.Dial(address, opts...)
+func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig) (*raftClient, error) {
+	conn, err := grpc.Dial(server.Address, server.Opts...)
 	if err != nil {
 		return nil, err
 	}
-
-	gClient := newRaftServiceClient(conn)
-
-	heartDur := time.Second * 2
-
 	return &raftClient{
-		gClient:        gClient,
-		conn:           conn,
-		address:        address,
-		id:             id,
-		piping:         false,
-		heartbeatTimer: time.NewTimer(heartDur),
-		heartDur:       heartDur,
+		gClient:  newRaftServiceClient(conn),
+		conn:     conn,
+		address:  server.Address,
+		id:       server.Id,
+		piping:   false,
+		heartDur: heartBeatDur,
+		conf:     conf,
 	}, nil
-
 }
 
 func (r *raftClient) buildAppendStream() error {
-	for i := 0; i < 3; i++ {
-		stream, err := r.gClient.AppendEntriesStream(context.Background())
+	ctx := context.Background()
+	for i := 0; i < r.conf.StreamBuildAttempts; i++ {
+		stream, err := r.gClient.AppendEntriesStream(ctx)
 		if err != nil {
-			time.Sleep(2 * time.Second)
+			time.Sleep(r.conf.StreamBuildTimeout)
 			continue
 		}
 
@@ -66,10 +58,11 @@ func (r *raftClient) buildAppendStream() error {
 }
 
 func (r *raftClient) buildHeartbeatStream() error {
-	for i := 0; i < 3; i++ {
-		stream, err := r.gClient.HeartBeatStream(context.Background())
+	ctx := context.Background()
+	for i := 0; i < r.conf.StreamBuildAttempts; i++ {
+		stream, err := r.gClient.HeartBeatStream(ctx)
 		if err != nil {
-			time.Sleep(2 * time.Second)
+			time.Sleep(r.conf.StreamBuildTimeout)
 			continue
 		}
 
@@ -88,19 +81,19 @@ func (r *raftClient) startPiping(logStore LogStore, startIndex, endIndex uint64)
 	}()
 
 	current := startIndex
-
-	for i := 0; r.pipestream == nil && i < 3; i++ {
-		stream, err := r.gClient.PipeEntries(context.Background())
+	ctx := context.Background()
+	for i := 0; r.pipestream == nil && i < r.conf.StreamBuildAttempts; i++ {
+		stream, err := r.gClient.PipeEntries(ctx)
 		if err == nil {
 			r.pipestream = stream
 			break
 		}
 
-		if i == 2 {
+		if i == r.conf.StreamBuildAttempts-1 {
 			return err
 		}
 
-		time.Sleep(time.Second)
+		time.Sleep(r.conf.StreamBuildTimeout)
 	}
 
 	for current <= endIndex {
@@ -142,7 +135,6 @@ func (r *raftClient) startheartBeat() {
 				break
 			}
 
-			// r.heartbeatTimer.Reset(r.heartDur)
 			time.Sleep(r.heartDur)
 		}
 
@@ -198,7 +190,7 @@ func (r *raftClient) recreateAppendStream() {
 		stream, err := r.gClient.AppendEntriesStream(context.Background())
 		if err != nil {
 			log.Error().Uint64("clientId", r.id).Err(err).Msg("cannot find client for append stream")
-			time.Sleep(2 * time.Second)
+			time.Sleep(r.conf.StreamBuildTimeout)
 			continue
 		}
 
@@ -222,7 +214,7 @@ func (r *raftClient) append(ctx context.Context, req *AppendEntriesRequest, wg *
 }
 
 func (r *raftClient) timeout(wg *sync.WaitGroup, atom *AtomicCounter) {
-	time.Sleep(3 * time.Second)
+	time.Sleep(r.conf.AppendTimeout)
 	if atom.HasId(r.id) {
 		return
 	}
