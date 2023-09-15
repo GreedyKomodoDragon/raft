@@ -52,7 +52,6 @@ type raft struct {
 	commitLock *sync.Mutex
 
 	// constants
-	reqAppend *AppendEntriesRequest
 	reqCommit *CommitLogRequest
 
 	// election
@@ -95,7 +94,6 @@ func NewRaftServer(logStore LogStore, conf *Configuration) Raft {
 		applyLock:     &sync.Mutex{},
 		commitLock:    &sync.Mutex{},
 		clientHalf:    uint64(len(clients)/2 + 1),
-		reqAppend:     &AppendEntriesRequest{},
 		reqCommit:     &CommitLogRequest{},
 		electManager:  elect,
 		voteRequested: votesRequestedChan,
@@ -203,9 +201,12 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	ctx := context.Background()
 
-	r.reqAppend.Term = r.logStore.GetLatestTerm()
-	r.reqAppend.Type = typ
-	r.reqAppend.Data = data
+	// TODO: replace with reset-able value
+	reqAppend := &AppendEntriesRequest{
+		Term: r.logStore.GetLatestTerm(),
+		Type: typ,
+		Data: data,
+	}
 
 	reqLog := Log{
 		Term:           r.logStore.GetLatestTerm(),
@@ -222,7 +223,7 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	defer r.applyLock.Unlock()
 
 	latestIndex := r.logStore.GetLatestIndex()
-	r.reqAppend.Index = latestIndex
+	reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
 	for _, client := range r.clients {
@@ -231,7 +232,7 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 			continue
 		}
 
-		go client.append(ctx, r.reqAppend, wg, counter)
+		go client.append(ctx, reqAppend, wg, counter)
 	}
 
 	if err := r.logStore.AppendLog(&reqLog); err != nil {
