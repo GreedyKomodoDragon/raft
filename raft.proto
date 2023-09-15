@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+option go_package = "./raft";
+
+package raft;
+
+// Interface exported by the server.
+service RaftService {
+   rpc RequestVotes(RequestVotesRequest) returns (RequestVotesResult) {}
+   rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
+   rpc CommitLog(CommitLogRequest) returns (CommitLogResult) {}
+   rpc AppendEntriesStream(stream AppendEntriesRequest) returns (stream AppendEntriesResult) {}
+   rpc PipeEntries(stream PipeEntriesRequest) returns (stream PipeEntriesResponse) {}
+   rpc HeartBeatStream(stream HeartBeatRequest) returns (stream HeartBeatResult) {}
+}
+
+message StatusRequest {}
+
+message StatusResult {
+   bytes status = 1;
+}
+  
+message RequestVotesRequest {
+   uint64 term = 1;
+   uint64 index = 2;
+   uint64 id = 3;
+}
+
+message RequestVotesResult {
+}
+
+message AppendEntriesRequest {
+   uint64 term = 1;
+   uint64 index = 2;
+   uint64 type = 3;
+   bytes  data = 4;
+}
+
+message AppendEntriesResult {
+   bool applied = 1;
+   uint64 index = 2;
+}
+
+message HeartBeatRequest {
+}
+ 
+message HeartBeatResult {
+}
+
+message SendVoteRequest {
+   bool voted = 1;
+   uint64 id = 2;
+}
+ 
+message SendVoteResult {
+}
+
+message CommitLogRequest {
+   uint64 index = 1;
+}
+ 
+message CommitLogResult {
+   bool applied = 1;
+   uint64 missing = 2;
+}
+
+message PipeEntriesRequest {
+   uint64 term = 1;
+   uint64 index = 2;
+   uint64 type = 3;
+   bytes  data = 4;
+   bool commited = 5;
+}
+ 
+message PipeEntriesResponse {
+   bool applied = 1;
+}
