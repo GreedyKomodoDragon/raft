@@ -62,7 +62,7 @@ type logStore struct {
 	persistMux *sync.Mutex
 }
 
-func NewLogStore() (LogStore, error) {
+func NewLogStore(threshold uint64) (LogStore, error) {
 	// log directory - Create a folder/directory at a full qualified path
 	err := os.MkdirAll(LOG_DIR, 0755)
 	if err != nil && !strings.Contains(err.Error(), "file exists") {
@@ -76,7 +76,7 @@ func NewLogStore() (LogStore, error) {
 		},
 		index:      1,
 		term:       0,
-		threshold:  2000,
+		threshold:  threshold,
 		persistMux: &sync.Mutex{},
 		piping:     false,
 	}, nil
