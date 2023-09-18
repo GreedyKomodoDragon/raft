@@ -61,13 +61,11 @@ type raft struct {
 	conf *RaftConfig
 }
 
-func NewRaftServer(logStore LogStore, conf *Configuration) Raft {
+func NewRaftServer(app ApplicationApply, logStore LogStore, conf *Configuration) Raft {
 	grpcServer := grpc.NewServer(conf.RaftConfig.ServerOpts...)
 	votesRequestedChan := make(chan *RequestVotesRequest, len(conf.RaftConfig.Servers))
 
-	appApply := &StdOutApply{}
-
-	if err := logStore.RestoreLogs(appApply); err != nil {
+	if err := logStore.RestoreLogs(app); err != nil {
 		log.Info().Msg("Unable to read in snapshots successfully")
 	}
 
@@ -83,14 +81,14 @@ func NewRaftServer(logStore LogStore, conf *Configuration) Raft {
 	}
 
 	elect := newElectionManager(logStore, len(conf.RaftConfig.Servers), conf.ElectionConfig)
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, appApply, elect))
+	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, app, elect))
 
 	return &raft{
 		clients:       clients,
 		grpc:          grpcServer,
 		logStore:      logStore,
 		id:            conf.RaftConfig.Id,
-		appApply:      appApply,
+		appApply:      app,
 		applyLock:     &sync.Mutex{},
 		commitLock:    &sync.Mutex{},
 		clientHalf:    uint64(len(clients)/2 + 1),
