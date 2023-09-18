@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"fmt"
-	"net"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -26,7 +25,7 @@ type Result struct {
 }
 
 type Raft interface {
-	Start(net.Listener)
+	Start()
 	ApplyLog([]byte, uint64) ([]byte, error)
 	LeaderChan() chan interface{}
 }
@@ -61,8 +60,7 @@ type raft struct {
 	conf *RaftConfig
 }
 
-func NewRaftServer(app ApplicationApply, logStore LogStore, conf *Configuration) Raft {
-	grpcServer := grpc.NewServer(conf.RaftConfig.ServerOpts...)
+func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Server, conf *Configuration) Raft {
 	votesRequestedChan := make(chan *RequestVotesRequest, len(conf.RaftConfig.Servers))
 
 	if err := logStore.RestoreLogs(app); err != nil {
@@ -104,13 +102,9 @@ func (r *raft) LeaderChan() chan interface{} {
 	return r.leaderChan
 }
 
-func (r *raft) Start(lis net.Listener) {
+func (r *raft) Start() {
 	go r.electManager.start()
 	go r.start()
-
-	if err := r.grpc.Serve(lis); err != nil {
-		panic(err) // unable to handle this
-	}
 }
 
 func (r *raft) broadCastVotes() {
