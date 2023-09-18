@@ -1,4 +1,4 @@
-module greedykomodo/raft
+module github.com/GreedyKomodoDragon/raft 
 
 go 1.20
 
