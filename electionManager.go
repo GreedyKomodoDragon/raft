@@ -8,7 +8,7 @@ import (
 )
 
 type electionManager struct {
-	currentState  role
+	currentState  Role
 	foundLeader   bool
 	votes         uint64
 	clientedVoted uint64

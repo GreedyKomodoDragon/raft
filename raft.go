@@ -9,10 +9,10 @@ import (
 	"google.golang.org/grpc"
 )
 
-type role uint32
+type Role uint32
 
 const (
-	UNKNOWN role = iota
+	UNKNOWN Role = iota
 	FOLLOWER
 	CANDIDATE
 	LEADER
@@ -26,8 +26,9 @@ type Result struct {
 
 type Raft interface {
 	Start()
-	ApplyLog([]byte, uint64) ([]byte, error)
+	ApplyLog([]byte, uint64) (interface{}, error)
 	LeaderChan() chan interface{}
+	State() Role
 }
 
 type raft struct {
@@ -157,7 +158,7 @@ func (r *raft) start() {
 
 }
 
-func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
+func (r *raft) ApplyLog(data []byte, typ uint64) (interface{}, error) {
 	lg, err := r.broadCastAppendLog(data, typ)
 	if err != nil {
 		return nil, err
@@ -181,13 +182,13 @@ func (r *raft) ApplyLog(data []byte, typ uint64) ([]byte, error) {
 	}
 
 	// apply log
-	data, err = r.appApply.Apply(*lg)
+	dat, err := r.appApply.Apply(*lg)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to apply log")
 	}
 
 	wg.Wait()
-	return data, nil
+	return dat, nil
 }
 
 func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
@@ -308,4 +309,8 @@ func (r *raft) getClientByID(id uint64) (*raftClient, error) {
 	}
 
 	return nil, fmt.Errorf("cannot find client")
+}
+
+func (r *raft) State() Role {
+	return r.electManager.currentState
 }
