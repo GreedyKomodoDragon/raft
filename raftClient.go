@@ -10,6 +10,11 @@ import (
 	"google.golang.org/grpc"
 )
 
+type chanItem struct {
+	atom *AtomicCounter
+	req  *AppendEntriesRequest
+}
+
 type raftClient struct {
 	gClient         raftServiceClient
 	conn            *grpc.ClientConn
@@ -23,21 +28,24 @@ type raftClient struct {
 	atom            *AtomicCounter
 	wg              *sync.WaitGroup
 	conf            *ClientConfig
+	appendChannel   chan *chanItem
 }
 
-func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig) (*raftClient, error) {
+func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig, wg *sync.WaitGroup) (*raftClient, error) {
 	conn, err := grpc.Dial(server.Address, server.Opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &raftClient{
-		gClient:  newRaftServiceClient(conn),
-		conn:     conn,
-		address:  server.Address,
-		id:       server.Id,
-		piping:   false,
-		heartDur: heartBeatDur,
-		conf:     conf,
+		gClient:       newRaftServiceClient(conn),
+		conn:          conn,
+		address:       server.Address,
+		id:            server.Id,
+		piping:        false,
+		heartDur:      heartBeatDur,
+		conf:          conf,
+		wg:            wg,
+		appendChannel: make(chan *chanItem, 1),
 	}, nil
 }
 
@@ -199,26 +207,27 @@ func (r *raftClient) recreateAppendStream() {
 	}
 }
 
-func (r *raftClient) append(ctx context.Context, req *AppendEntriesRequest, wg *sync.WaitGroup, atom *AtomicCounter) {
-	r.atom = atom
-	r.wg = wg
+func (r *raftClient) append() {
+	for item := range r.appendChannel {
+		r.atom = item.atom
 
-	if err := r.stream.Send(req); err != nil {
-		log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
-		r.wg.Done()
-		return
+		if err := r.stream.Send(item.req); err != nil {
+			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
+			r.wg.Done()
+			return
+		}
+
+		// start timeout
+		go r.timeout(item.atom)
 	}
-
-	// start timeout
-	go r.timeout(wg, atom)
 }
 
-func (r *raftClient) timeout(wg *sync.WaitGroup, atom *AtomicCounter) {
+func (r *raftClient) timeout(atom *AtomicCounter) {
 	time.Sleep(r.conf.AppendTimeout)
 	if atom.HasId(r.id) {
 		return
 	}
 
 	atom.AddIdOnly(r.id)
-	wg.Done()
+	r.wg.Done()
 }

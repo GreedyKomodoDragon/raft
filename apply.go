@@ -1,7 +1,5 @@
 package raft
 
-import "fmt"
-
 const (
 	DATA_LOG uint64 = iota
 	RAFT_LOG
@@ -15,6 +13,6 @@ type StdOutApply struct {
 }
 
 func (s *StdOutApply) Apply(log Log) (interface{}, error) {
-	fmt.Println("log applied:", log.Index, string(log.Data))
+	// fmt.Println("log applied:", log.Index, string(log.Data))
 	return nil, nil
 }
