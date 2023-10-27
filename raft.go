@@ -72,10 +72,11 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 	}
 
 	appendWait := &sync.WaitGroup{}
+	commitWait := &sync.WaitGroup{}
 
 	clients := []*raftClient{}
 	for _, server := range conf.RaftConfig.Servers {
-		client, err := newRaftClient(server, conf.ElectionConfig.HeartbeatTimeout, conf.RaftConfig.ClientConf, appendWait)
+		client, err := newRaftClient(server, conf.ElectionConfig.HeartbeatTimeout, conf.RaftConfig.ClientConf, appendWait, commitWait, logStore)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to create client")
 			continue
@@ -101,7 +102,7 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 		voteRequested: votesRequestedChan,
 		leaderChan:    make(chan interface{}, 1),
 		conf:          conf.RaftConfig,
-		commitWait:    &sync.WaitGroup{},
+		commitWait:    commitWait,
 		appendWait:    appendWait,
 	}
 }
@@ -180,11 +181,9 @@ func (r *raft) ApplyLog(data *[]byte, typ uint64) (interface{}, error) {
 
 	r.reqCommit.Index = lg.Index
 
-	ctx := context.Background()
-
 	r.commitWait.Add(len(r.clients))
 	for _, client := range r.clients {
-		go r.applyClient(ctx, client, r.reqCommit)
+		client.commitChan <- r.reqCommit
 	}
 
 	// apply log
@@ -262,26 +261,6 @@ func (r *raft) broadCastAppendLog(data *[]byte, typ uint64) (*Log, error) {
 	return &reqLog, nil
 }
 
-func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest) {
-	defer r.commitWait.Done()
-
-	result, err := client.gClient.CommitLog(ctx, commitReq)
-	if err != nil {
-		log.Error().Err(err).Msg("client failed to append")
-		return
-	}
-
-	if result.Missing != 0 && !client.piping {
-		// start piping logs
-		log.Info().Uint64("clientId", client.id).Msg("start piping to client")
-		go client.startPiping(r.logStore, result.Missing, commitReq.Index)
-	}
-
-	if !result.Applied {
-		log.Error().Uint64("clientId", client.id).Uint64("index", commitReq.Index).Msg("client failed to commit")
-	}
-}
-
 func (r *raft) buildStreams() {
 	wg := &sync.WaitGroup{}
 	wg.Add(len(r.clients) * 2)
@@ -310,6 +289,7 @@ func (r *raft) startStream() {
 		go client.startApplyResultStream()
 		go client.startheartBeat()
 		go client.append()
+		go client.apply()
 	}
 }
 

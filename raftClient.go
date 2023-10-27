@@ -29,9 +29,12 @@ type raftClient struct {
 	wg              *sync.WaitGroup
 	conf            *ClientConfig
 	appendChannel   chan *chanItem
+	commitChan      chan *CommitLogRequest
+	commitWait      *sync.WaitGroup
+	logStore        LogStore
 }
 
-func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig, wg *sync.WaitGroup) (*raftClient, error) {
+func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig, wg, commitWait *sync.WaitGroup, logStore LogStore) (*raftClient, error) {
 	conn, err := grpc.Dial(server.Address, server.Opts...)
 	if err != nil {
 		return nil, err
@@ -46,6 +49,9 @@ func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig
 		conf:          conf,
 		wg:            wg,
 		appendChannel: make(chan *chanItem, 1),
+		commitChan:    make(chan *CommitLogRequest, 1),
+		commitWait:    commitWait,
+		logStore:      logStore,
 	}, nil
 }
 
@@ -220,6 +226,31 @@ func (r *raftClient) append() {
 		// start timeout
 		go r.timeout(item.atom)
 	}
+}
+
+func (r *raftClient) apply() {
+	for commitReq := range r.commitChan {
+
+		result, err := r.gClient.CommitLog(context.Background(), commitReq)
+		if err != nil {
+			log.Error().Err(err).Msg("client failed to append")
+			r.commitWait.Done()
+			continue
+		}
+
+		if result.Missing != 0 && !r.piping {
+			// start piping logs
+			log.Info().Uint64("clientId", r.id).Msg("start piping to client")
+			go r.startPiping(r.logStore, result.Missing, commitReq.Index)
+		}
+
+		if !result.Applied {
+			log.Error().Uint64("clientId", r.id).Uint64("index", commitReq.Index).Msg("client failed to commit")
+		}
+
+		r.commitWait.Done()
+	}
+
 }
 
 func (r *raftClient) timeout(atom *AtomicCounter) {
