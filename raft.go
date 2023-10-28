@@ -26,7 +26,7 @@ type Result struct {
 
 type Raft interface {
 	Start()
-	ApplyLog([]byte, uint64) (interface{}, error)
+	ApplyLog(*[]byte, uint64) (interface{}, error)
 	LeaderChan() chan interface{}
 	State() Role
 }
@@ -59,6 +59,9 @@ type raft struct {
 
 	// raft configurations
 	conf *RaftConfig
+
+	commitWait *sync.WaitGroup
+	appendWait *sync.WaitGroup
 }
 
 func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Server, conf *Configuration) Raft {
@@ -68,9 +71,12 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 		log.Info().Msg("Unable to read in snapshots successfully")
 	}
 
+	appendWait := &sync.WaitGroup{}
+	commitWait := &sync.WaitGroup{}
+
 	clients := []*raftClient{}
 	for _, server := range conf.RaftConfig.Servers {
-		client, err := newRaftClient(server, conf.ElectionConfig.HeartbeatTimeout, conf.RaftConfig.ClientConf)
+		client, err := newRaftClient(server, conf.ElectionConfig.HeartbeatTimeout, conf.RaftConfig.ClientConf, appendWait, commitWait, logStore)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to create client")
 			continue
@@ -96,6 +102,8 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 		voteRequested: votesRequestedChan,
 		leaderChan:    make(chan interface{}, 1),
 		conf:          conf.RaftConfig,
+		commitWait:    commitWait,
+		appendWait:    appendWait,
 	}
 }
 
@@ -131,7 +139,7 @@ func (r *raft) start() {
 			r.startStream()
 
 			// send logs to followers and self
-			if _, err := r.ApplyLog([]byte{}, RAFT_LOG); err != nil {
+			if _, err := r.ApplyLog(&[]byte{}, RAFT_LOG); err != nil {
 				log.Error().Err(err).Msg("unable to send leader log")
 			}
 
@@ -158,7 +166,7 @@ func (r *raft) start() {
 
 }
 
-func (r *raft) ApplyLog(data []byte, typ uint64) (interface{}, error) {
+func (r *raft) ApplyLog(data *[]byte, typ uint64) (interface{}, error) {
 	lg, err := r.broadCastAppendLog(data, typ)
 	if err != nil {
 		return nil, err
@@ -171,14 +179,11 @@ func (r *raft) ApplyLog(data []byte, typ uint64) (interface{}, error) {
 		return nil, nil
 	}
 
-	var wg sync.WaitGroup
 	r.reqCommit.Index = lg.Index
 
-	ctx := context.Background()
-
-	wg.Add(len(r.clients))
+	r.commitWait.Add(len(r.clients))
 	for _, client := range r.clients {
-		go r.applyClient(ctx, client, r.reqCommit, &wg)
+		client.commitChan <- r.reqCommit
 	}
 
 	// apply log
@@ -187,45 +192,51 @@ func (r *raft) ApplyLog(data []byte, typ uint64) (interface{}, error) {
 		log.Error().Err(err).Msg("failed to apply log")
 	}
 
-	wg.Wait()
+	r.commitWait.Wait()
 	return dat, nil
 }
 
-func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
+func (r *raft) broadCastAppendLog(data *[]byte, typ uint64) (*Log, error) {
 	ctx := context.Background()
+	defer ctx.Done()
 
 	// TODO: replace with reset-able value
 	reqAppend := &AppendEntriesRequest{
 		Term: r.logStore.GetLatestTerm(),
 		Type: typ,
-		Data: data,
+		Data: *data,
 	}
 
+	// TODO: re-use
 	reqLog := Log{
 		Term:           r.logStore.GetLatestTerm(),
 		LogType:        DATA_LOG,
-		Data:           data,
+		Data:           *data,
 		LeaderCommited: false,
 	}
 
-	wg := &sync.WaitGroup{}
-	wg.Add(len(r.clients))
-	counter := NewAtomicCounter()
-
 	r.applyLock.Lock()
 	defer r.applyLock.Unlock()
+
+	r.appendWait.Add(len(r.clients))
 
 	latestIndex := r.logStore.GetLatestIndex()
 	reqAppend.Index = latestIndex
 	reqLog.Index = latestIndex
 
+	// TODO: re-use
+	chanItem := &chanItem{
+		atom: NewAtomicCounter(),
+		req:  reqAppend,
+	}
+
 	for _, client := range r.clients {
 		if client.stream == nil {
-			wg.Done()
+			r.appendWait.Done()
 			continue
 		}
 
-		go client.append(ctx, reqAppend, wg, counter)
+		client.appendChannel <- chanItem
 	}
 
 	if err := r.logStore.AppendLog(&reqLog); err != nil {
@@ -233,10 +244,13 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 		return nil, err
 	}
 
-	wg.Wait()
+	r.appendWait.Wait()
+
+	// TODO: re-use
 	limit := r.clientHalf - 1
-	if uint64(counter.IdCount()) < limit {
-		log.Error().Int("counter", counter.IdCount()).Uint64("limit", limit).Msg("failed to confirm log")
+
+	if uint64(chanItem.atom.IdCount()) < limit {
+		log.Error().Int("counter", chanItem.atom.IdCount()).Uint64("limit", limit).Msg("failed to confirm log")
 		return nil, fmt.Errorf("failed to confirm log")
 	}
 
@@ -245,26 +259,6 @@ func (r *raft) broadCastAppendLog(data []byte, typ uint64) (*Log, error) {
 	r.commitLock.Lock()
 
 	return &reqLog, nil
-}
-
-func (r *raft) applyClient(ctx context.Context, client *raftClient, commitReq *CommitLogRequest, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	result, err := client.gClient.CommitLog(ctx, commitReq)
-	if err != nil {
-		log.Error().Err(err).Msg("client failed to append")
-		return
-	}
-
-	if result.Missing != 0 && !client.piping {
-		// start piping logs
-		log.Info().Uint64("clientId", client.id).Msg("start piping to client")
-		go client.startPiping(r.logStore, result.Missing, commitReq.Index)
-	}
-
-	if !result.Applied {
-		log.Error().Uint64("clientId", client.id).Uint64("index", commitReq.Index).Msg("client failed to commit")
-	}
 }
 
 func (r *raft) buildStreams() {
@@ -294,6 +288,8 @@ func (r *raft) startStream() {
 	for _, client := range r.clients {
 		go client.startApplyResultStream()
 		go client.startheartBeat()
+		go client.append()
+		go client.apply()
 	}
 }
 

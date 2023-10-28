@@ -310,6 +310,7 @@ func (l *logStore) persistLog() error {
 
 		defer f.Close()
 
+		data := []byte{}
 		for i := lower; i <= upper; i++ {
 			lg, err := l.GetLog(i)
 			if err != nil {
@@ -323,11 +324,13 @@ func (l *logStore) persistLog() error {
 				return err
 			}
 
-			logData = append(logData, BREAK_SYMBOL...)
-			if _, err := f.Write(logData); err != nil {
-				log.Error().Bytes("data", logData).Uint64("index", i).Err(err).Msg("failed to write log data to disk")
-				return err
-			}
+			data = append(data, logData...)
+			data = append(data, BREAK_SYMBOL...)
+		}
+
+		if _, err := f.Write(data); err != nil {
+			log.Error().Bytes("data", data).Err(err).Msg("failed to write log data to disk")
+			return err
 		}
 
 		// delete logs after

@@ -1,6 +1,8 @@
 package raft
 
-import sync "sync"
+import (
+	sync "sync"
+)
 
 type safeMap struct {
 	data map[uint64]*Log
