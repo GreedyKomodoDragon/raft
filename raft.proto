@@ -5,10 +5,10 @@ option go_package = "./raft";
 package raft;
 
 // Interface exported by the server.
-service RaftService {
+service RaftGRPC {
    rpc RequestVotes(RequestVotesRequest) returns (RequestVotesResult) {}
    rpc SendVote(SendVoteRequest) returns (SendVoteResult) {}
-   rpc CommitLog(CommitLogRequest) returns (CommitLogResult) {}
+   rpc CommitLog(stream CommitLogRequest) returns (stream CommitLogResult) {}
    rpc AppendEntriesStream(stream AppendEntriesRequest) returns (stream AppendEntriesResult) {}
    rpc PipeEntries(stream PipeEntriesRequest) returns (stream PipeEntriesResponse) {}
    rpc HeartBeatStream(stream HeartBeatRequest) returns (stream HeartBeatResult) {}
