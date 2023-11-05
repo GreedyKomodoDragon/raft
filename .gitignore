@@ -23,3 +23,5 @@ go.work
 main.go
 
 testing/node_*
+
+.DS_Store

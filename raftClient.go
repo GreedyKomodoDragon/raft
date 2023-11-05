@@ -15,41 +15,48 @@ type chanItem struct {
 	req  *AppendEntriesRequest
 }
 
+type commitItem struct {
+	atom *AtomicCounter
+	req  *CommitLogRequest
+}
+
 type raftClient struct {
-	gClient         raftServiceClient
+	gClient         RaftGRPCClient
 	conn            *grpc.ClientConn
 	address         string
 	id              uint64
-	stream          AppendEntriesStreamClient
-	pipestream      pipeEntriesClient
-	heartBeatStream heartBeatStreamClient
+	stream          RaftGRPC_AppendEntriesStreamClient
+	pipestream      RaftGRPC_PipeEntriesClient
+	heartBeatStream RaftGRPC_HeartBeatStreamClient
+	commitStream    RaftGRPC_CommitLogClient
 	piping          bool
 	heartDur        time.Duration
 	atom            *AtomicCounter
-	wg              *sync.WaitGroup
+	atomCommit      *AtomicCounter
+	appendWait      *sync.WaitGroup
 	conf            *ClientConfig
 	appendChannel   chan *chanItem
-	commitChan      chan *CommitLogRequest
+	commitChan      chan *commitItem
 	commitWait      *sync.WaitGroup
 	logStore        LogStore
 }
 
-func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig, wg, commitWait *sync.WaitGroup, logStore LogStore) (*raftClient, error) {
+func newRaftClient(server Server, heartBeatDur time.Duration, conf *ClientConfig, appendWait, commitWait *sync.WaitGroup, logStore LogStore) (*raftClient, error) {
 	conn, err := grpc.Dial(server.Address, server.Opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &raftClient{
-		gClient:       newRaftServiceClient(conn),
+		gClient:       newRaftGRPCClient(conn),
 		conn:          conn,
 		address:       server.Address,
 		id:            server.Id,
 		piping:        false,
 		heartDur:      heartBeatDur,
 		conf:          conf,
-		wg:            wg,
+		appendWait:    appendWait,
 		appendChannel: make(chan *chanItem, 1),
-		commitChan:    make(chan *CommitLogRequest, 1),
+		commitChan:    make(chan *commitItem, 1),
 		commitWait:    commitWait,
 		logStore:      logStore,
 	}, nil
@@ -85,6 +92,22 @@ func (r *raftClient) buildHeartbeatStream() error {
 	}
 
 	return fmt.Errorf("failed to create heartbeat stream")
+}
+
+func (r *raftClient) buildCommitStream() error {
+	ctx := context.Background()
+	for i := 0; i < r.conf.StreamBuildAttempts; i++ {
+		stream, err := r.gClient.CommitLog(ctx)
+		if err != nil {
+			time.Sleep(r.conf.StreamBuildTimeout)
+			continue
+		}
+
+		r.commitStream = stream
+		return nil
+	}
+
+	return fmt.Errorf("failed to create commit stream")
 }
 
 func (r *raftClient) startPiping(logStore LogStore, startIndex, endIndex uint64) error {
@@ -166,7 +189,7 @@ func (r *raftClient) startheartBeat() {
 	}
 }
 
-func (r *raftClient) startApplyResultStream() {
+func (r *raftClient) startAppendResultStream() {
 	for {
 		for {
 			if r.stream == nil {
@@ -185,12 +208,12 @@ func (r *raftClient) startApplyResultStream() {
 
 			if !in.Applied {
 				log.Debug().Uint64("clientId", r.id).Err(err).Msg("not applied in result stream")
-				r.wg.Done()
+				r.appendWait.Done()
 				continue
 			}
 
 			r.atom.Increment(r.id)
-			r.wg.Done()
+			r.appendWait.Done()
 		}
 
 		r.recreateAppendStream()
@@ -219,46 +242,86 @@ func (r *raftClient) append() {
 
 		if err := r.stream.Send(item.req); err != nil {
 			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
-			r.wg.Done()
+			r.appendWait.Done()
 			return
 		}
 
 		// start timeout
-		go r.timeout(item.atom)
+		go r.timeout(item.atom, r.appendWait)
 	}
 }
 
-func (r *raftClient) apply() {
-	for commitReq := range r.commitChan {
+func (r *raftClient) commitSend() {
+	for item := range r.commitChan {
+		r.atomCommit = item.atom
 
-		result, err := r.gClient.CommitLog(context.Background(), commitReq)
-		if err != nil {
-			log.Error().Err(err).Msg("client failed to append")
+		if err := r.commitStream.Send(item.req); err != nil {
+			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
+			r.appendWait.Done()
+			return
+		}
+
+		// start timeout
+		go r.timeout(item.atom, r.commitWait)
+	}
+}
+
+func (r *raftClient) startCommitStream() {
+	for {
+		for r.commitStream != nil {
+			result, err := r.commitStream.Recv()
+			if err != nil {
+				log.Error().Err(err).Msg("error recieving commit result")
+				break
+			}
+
+			if result.Missing != 0 && !r.piping {
+				// start piping logs
+				log.Info().Uint64("clientId", r.id).Msg("start piping to client")
+				go r.startPiping(r.logStore, result.Missing, r.logStore.GetLatestIndex())
+
+				r.atomCommit.AddIdOnly(r.id)
+				r.appendWait.Done()
+				continue
+			}
+
+			if !result.Applied {
+				log.Error().Uint64("clientId", r.id).Msg("client failed to commit")
+				r.atomCommit.AddIdOnly(r.id)
+				r.appendWait.Done()
+				continue
+			}
+
+			r.atomCommit.Increment(r.id)
 			r.commitWait.Done()
-			continue
 		}
 
-		if result.Missing != 0 && !r.piping {
-			// start piping logs
-			log.Info().Uint64("clientId", r.id).Msg("start piping to client")
-			go r.startPiping(r.logStore, result.Missing, commitReq.Index)
-		}
-
-		if !result.Applied {
-			log.Error().Uint64("clientId", r.id).Uint64("index", commitReq.Index).Msg("client failed to commit")
-		}
-
-		r.commitWait.Done()
+		r.recreateCommitStream()
 	}
 
 }
 
-func (r *raftClient) timeout(atom *AtomicCounter) {
+func (r *raftClient) timeout(atom *AtomicCounter, wg *sync.WaitGroup) {
 	time.Sleep(r.conf.AppendTimeout)
 	if atom.HasId(r.id) {
 		return
 	}
 
 	atom.AddIdOnly(r.id)
-	r.wg.Done()
+	wg.Done()
+}
+
+// will loop until stream is established
+func (r *raftClient) recreateCommitStream() {
+	for {
+		stream, err := r.gClient.CommitLog(context.Background())
+		if err != nil {
+			log.Error().Uint64("clientId", r.id).Err(err).Msg("cannot find client for commit stream")
+			time.Sleep(r.conf.StreamBuildTimeout)
+			continue
+		}
+
+		r.commitStream = stream
+		break
+	}
 }

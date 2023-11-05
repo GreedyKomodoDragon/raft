@@ -86,7 +86,7 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 	}
 
 	elect := newElectionManager(logStore, len(conf.RaftConfig.Servers), conf.ElectionConfig)
-	grpcServer.RegisterService(&raftService_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, app, elect))
+	grpcServer.RegisterService(&raftGRPC_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, app, elect))
 
 	return &raft{
 		clients:       clients,
@@ -181,9 +181,14 @@ func (r *raft) ApplyLog(data *[]byte, typ uint64) (interface{}, error) {
 
 	r.reqCommit.Index = lg.Index
 
+	item := &commitItem{
+		atom: NewAtomicCounter(),
+		req:  r.reqCommit,
+	}
+
 	r.commitWait.Add(len(r.clients))
 	for _, client := range r.clients {
-		client.commitChan <- r.reqCommit
+		client.commitChan <- item
 	}
 
 	// apply log
@@ -250,8 +255,8 @@ func (r *raft) broadCastAppendLog(data *[]byte, typ uint64) (*Log, error) {
 	limit := r.clientHalf - 1
 
 	if uint64(chanItem.atom.IdCount()) < limit {
-		log.Error().Int("counter", chanItem.atom.IdCount()).Uint64("limit", limit).Msg("failed to confirm log")
-		return nil, fmt.Errorf("failed to confirm log")
+		log.Error().Int("counter", chanItem.atom.IdCount()).Uint64("limit", limit).Msg("failed to append log")
+		return nil, fmt.Errorf("failed to append log")
 	}
 
 	r.logStore.IncrementIndex()
@@ -263,7 +268,7 @@ func (r *raft) broadCastAppendLog(data *[]byte, typ uint64) (*Log, error) {
 
 func (r *raft) buildStreams() {
 	wg := &sync.WaitGroup{}
-	wg.Add(len(r.clients) * 2)
+	wg.Add(len(r.clients) * 3)
 
 	for _, client := range r.clients {
 		go func(client *raftClient) {
@@ -279,6 +284,13 @@ func (r *raft) buildStreams() {
 				log.Error().Err(err).Msg("unable to build heartbeat stream")
 			}
 		}(client)
+
+		go func(client *raftClient) {
+			defer wg.Done()
+			if err := client.buildCommitStream(); err != nil {
+				log.Error().Err(err).Msg("unable to build commit stream")
+			}
+		}(client)
 	}
 
 	wg.Wait()
@@ -286,10 +298,11 @@ func (r *raft) buildStreams() {
 
 func (r *raft) startStream() {
 	for _, client := range r.clients {
-		go client.startApplyResultStream()
-		go client.startheartBeat()
+		go client.startAppendResultStream()
 		go client.append()
-		go client.apply()
+		go client.startheartBeat()
+		go client.startCommitStream()
+		go client.commitSend()
 	}
 }
 
