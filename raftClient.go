@@ -198,6 +198,7 @@ func (r *raftClient) startAppendResultStream() {
 
 			in, err := r.stream.Recv()
 			if err != nil {
+				r.stream = nil
 				break
 			}
 
@@ -289,6 +290,7 @@ func (r *raftClient) startCommitStream() {
 			result, err := r.commitStream.Recv()
 			if err != nil {
 				log.Error().Err(err).Msg("error recieving commit result")
+				r.commitStream = nil
 				break
 			}
 
