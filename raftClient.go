@@ -240,6 +240,12 @@ func (r *raftClient) append() {
 	for item := range r.appendChannel {
 		r.atom = item.atom
 
+		if r.stream == nil {
+			log.Debug().Uint64("clientId", r.id).Msg("stream does not exist for appending")
+			r.appendWait.Done()
+			continue
+		}
+
 		if err := r.stream.Send(item.req); err != nil {
 			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
 			r.appendWait.Done()
@@ -255,9 +261,16 @@ func (r *raftClient) commitSend() {
 	for item := range r.commitChan {
 		r.atomCommit = item.atom
 
+		// put it back on the stream
+		if r.commitStream == nil {
+			log.Debug().Uint64("clientId", r.id).Msg("stream does not exist for commit")
+			r.commitWait.Done()
+			continue
+		}
+
 		if err := r.commitStream.Send(item.req); err != nil {
-			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in append stream")
-			r.appendWait.Done()
+			log.Error().Uint64("clientId", r.id).Err(err).Msg("failed to send in commit stream")
+			r.commitWait.Done()
 			return
 		}
 
@@ -268,7 +281,11 @@ func (r *raftClient) commitSend() {
 
 func (r *raftClient) startCommitStream() {
 	for {
-		for r.commitStream != nil {
+		for {
+			if r.commitStream == nil {
+				break
+			}
+
 			result, err := r.commitStream.Recv()
 			if err != nil {
 				log.Error().Err(err).Msg("error recieving commit result")
@@ -281,14 +298,14 @@ func (r *raftClient) startCommitStream() {
 				go r.startPiping(r.logStore, result.Missing, r.logStore.GetLatestIndex())
 
 				r.atomCommit.AddIdOnly(r.id)
-				r.appendWait.Done()
+				r.commitWait.Done()
 				continue
 			}
 
 			if !result.Applied {
 				log.Error().Uint64("clientId", r.id).Msg("client failed to commit")
 				r.atomCommit.AddIdOnly(r.id)
-				r.appendWait.Done()
+				r.commitWait.Done()
 				continue
 			}
 
@@ -313,7 +330,7 @@ func (r *raftClient) timeout(atom *AtomicCounter, wg *sync.WaitGroup) {
 
 // will loop until stream is established
 func (r *raftClient) recreateCommitStream() {
-	for {
+	for r.commitStream == nil {
 		stream, err := r.gClient.CommitLog(context.Background())
 		if err != nil {
 			log.Error().Uint64("clientId", r.id).Err(err).Msg("cannot find client for commit stream")
@@ -322,6 +339,5 @@ func (r *raftClient) recreateCommitStream() {
 		}
 
 		r.commitStream = stream
-		break
 	}
 }
