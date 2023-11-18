@@ -68,7 +68,9 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 	votesRequestedChan := make(chan *RequestVotesRequest, len(conf.RaftConfig.Servers))
 
 	if err := logStore.RestoreLogs(app); err != nil {
-		log.Info().Msg("Unable to read in snapshots successfully")
+		log.Error().Err(err).Msg("Unable to read in snapshots successfully")
+	} else {
+		log.Info().Uint64("index", logStore.GetLatestIndex()).Msg("restore id")
 	}
 
 	appendWait := &sync.WaitGroup{}
@@ -188,6 +190,11 @@ func (r *raft) ApplyLog(data *[]byte, typ uint64) (interface{}, error) {
 
 	r.commitWait.Add(len(r.clients))
 	for _, client := range r.clients {
+		if client.commitStream == nil {
+			r.commitWait.Done()
+			continue
+		}
+
 		client.commitChan <- item
 	}
 
