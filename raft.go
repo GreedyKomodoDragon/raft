@@ -25,7 +25,7 @@ type Result struct {
 }
 
 type Raft interface {
-	Start()
+	Start(grpc *grpc.Server)
 	ApplyLog(*[]byte, uint64) (interface{}, error)
 	LeaderChan() chan interface{}
 	State() Role
@@ -64,9 +64,7 @@ type raft struct {
 	appendWait *sync.WaitGroup
 }
 
-func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Server, conf *Configuration) Raft {
-	votesRequestedChan := make(chan *RequestVotesRequest, len(conf.RaftConfig.Servers))
-
+func NewRaftServer(app ApplicationApply, logStore LogStore, conf *Configuration) Raft {
 	if err := logStore.RestoreLogs(app); err != nil {
 		log.Error().Err(err).Msg("Unable to read in snapshots successfully")
 	} else {
@@ -88,24 +86,21 @@ func NewRaftServer(app ApplicationApply, logStore LogStore, grpcServer *grpc.Ser
 	}
 
 	elect := newElectionManager(logStore, len(conf.RaftConfig.Servers), conf.ElectionConfig)
-	grpcServer.RegisterService(&raftGRPC_ServiceDesc, newRaftGrpcServer(logStore, votesRequestedChan, app, elect))
 
 	return &raft{
-		clients:       clients,
-		grpc:          grpcServer,
-		logStore:      logStore,
-		id:            conf.RaftConfig.Id,
-		appApply:      app,
-		applyLock:     &sync.Mutex{},
-		commitLock:    &sync.Mutex{},
-		clientHalf:    uint64(len(clients)/2 + 1),
-		reqCommit:     &CommitLogRequest{},
-		electManager:  elect,
-		voteRequested: votesRequestedChan,
-		leaderChan:    make(chan interface{}, 1),
-		conf:          conf.RaftConfig,
-		commitWait:    commitWait,
-		appendWait:    appendWait,
+		clients:      clients,
+		logStore:     logStore,
+		id:           conf.RaftConfig.Id,
+		appApply:     app,
+		applyLock:    &sync.Mutex{},
+		commitLock:   &sync.Mutex{},
+		clientHalf:   uint64(len(clients)/2 + 1),
+		reqCommit:    &CommitLogRequest{},
+		electManager: elect,
+		leaderChan:   make(chan interface{}, 1),
+		conf:         conf.RaftConfig,
+		commitWait:   commitWait,
+		appendWait:   appendWait,
 	}
 }
 
@@ -113,7 +108,15 @@ func (r *raft) LeaderChan() chan interface{} {
 	return r.leaderChan
 }
 
-func (r *raft) Start() {
+func (r *raft) Start(grpcServer *grpc.Server) {
+	votesRequestedChan := make(chan *RequestVotesRequest, len(r.conf.Servers))
+
+	// register on start
+	grpcServer.RegisterService(&raftGRPC_ServiceDesc, newRaftGrpcServer(r.logStore, votesRequestedChan, r.appApply, r.electManager))
+
+	r.voteRequested = votesRequestedChan
+	r.grpc = grpcServer
+
 	go r.electManager.start()
 	go r.start()
 }
