@@ -208,7 +208,7 @@ func (r *raft) ApplyLog(data *[]byte, typ uint64) (interface{}, error) {
 	}
 
 	r.commitWait.Wait()
-	return dat, nil
+	return dat, err
 }
 
 func (r *raft) broadCastAppendLog(data *[]byte, typ uint64) (*Log, error) {
