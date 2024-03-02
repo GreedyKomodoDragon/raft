@@ -25,8 +25,7 @@ type logGlobStore struct {
 
 func NewLogGlobStore(threshold uint64) (LogStore, error) {
 	// log directory - Create a folder/directory at a full qualified path
-	err := os.MkdirAll(LOG_DIR, 0755)
-	if err != nil && !strings.Contains(err.Error(), "file exists") {
+	if err := os.MkdirAll(LOG_DIR, 0755); err != nil && !strings.Contains(err.Error(), "file exists") {
 		return nil, err
 	}
 
