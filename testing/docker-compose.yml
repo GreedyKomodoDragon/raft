@@ -12,6 +12,7 @@ services:
       - IDS=2,3
     volumes:
       - './node_1_data:/node_data'
+    mem_limit: 1000m
 
   raft_2:
     image: raft-test:latest
@@ -24,6 +25,7 @@ services:
       - IDS=1,3
     volumes:
       - './node_2_data:/node_data'
+    mem_limit: 1000m
 
   raft_3:
     image: raft-test:latest
@@ -36,6 +38,7 @@ services:
       - IDS=1,2
     volumes:
       - './node_3_data:/node_data'
+    mem_limit: 1000m
 
 networks:
   raftnet:

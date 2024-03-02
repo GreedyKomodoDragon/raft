@@ -366,12 +366,14 @@ func (l *logStore) RestoreLogs(app ApplicationApply) error {
 			log.Error().Str("location", location).Err(err).Msg("unable to open file")
 			continue
 		}
-		defer file.Close()
 
 		if err := l.restore(app, io.ReadCloser(file)); err != nil {
+			file.Close()
 			log.Error().Str("location", location).Err(err).Msg("unable to restore from file")
 			return err
 		}
+
+		file.Close()
 	}
 
 	return nil
