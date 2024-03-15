@@ -81,7 +81,7 @@ func (r *raftServer) CommitLog(stream RaftGRPC_CommitLogServer) error {
 
 			if err := stream.Send(&CommitLogResult{
 				Applied: true,
-				Missing: r.logStore.GetLatestIndex(),
+				Missing: r.logStore.GetLatestIndex() + 1,
 			}); err != nil {
 				return err
 			}
