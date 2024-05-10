@@ -142,7 +142,7 @@ func (r *raftClient) startPiping(logStore LogStore, startIndex, endIndex uint64)
 		}
 
 		if err := r.pipestream.Send(&PipeEntriesRequest{
-			Index:    current,
+			Index:    lg.Index,
 			Data:     lg.Data,
 			Commited: lg.LeaderCommited,
 			Term:     lg.Term,
